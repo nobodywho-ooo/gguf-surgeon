@@ -25,7 +25,7 @@ The editor is implemented in **Rust**. The language fits the constraints directl
 - **Type-tag dispatch with exhaustive matching.** GGUF's value-type enum maps to a Rust `enum`; `match` is checked at compile time, so a new primitive type added later is a hard compiler error rather than a silent fall-through.
 - **Cross-platform single binary.** Same codebase for Linux, macOS, and Windows; one static binary per platform makes distribution painless.
 
-The editor exposes both interaction modes from the same binary: a **CLI** with subcommands `list`, `get`, `set`, `add`, `rm`, `patch`, `info`, and `edit` for one-shot and scripted use, and a **TUI** built with `ratatui` (`gguf edit`) for interactive browsing and scalar editing. GGUF files almost always live on remote ML servers reachable only over SSH, so a terminal-native tool fits the audience; a graphical desktop UI is out of scope for the first release.
+The editor exposes both interaction modes from the same binary: a **CLI** with subcommands `list`, `get`, `set`, `add`, `rm`, `patch`, `info`, `check`, and `edit` for one-shot and scripted use, and a **TUI** built with `ratatui` (`gguf edit`) for interactive browsing and scalar editing. GGUF files almost always live on remote ML servers reachable only over SSH, so a terminal-native tool fits the audience; a graphical desktop UI is out of scope for the first release.
 
 **Supported GGUF versions: 1, 2, and 3** (little-endian). v1 used u32 length prefixes (deprecated in `llama.cpp`); v2 promoted them to u64; v3 is v2's binary layout with big-endian signaling added (big-endian parsing itself is future work). Files round-trip in their original version on save. Unknown versions fail loudly at open time.
 
@@ -45,12 +45,49 @@ gguf rm  MODEL.gguf outdated.key -y
 # Batch edits in one save (JSON patch)
 gguf patch MODEL.gguf changes.json -y
 
+# Read-only diagnostic: format + built-in suggestions + optional --schema
+gguf check MODEL.gguf
+gguf --schema my-rules.json check MODEL.gguf
+gguf check MODEL.gguf --no-default-schema   # skip the built-in suggestions
+
 # Interactive TUI: j/k to move, / to search, e to edit, s to save, q to quit
 gguf edit MODEL.gguf
 
 # Validate against a schema overlay; --force overrides schema errors
 gguf --schema rules.json set MODEL.gguf general.architecture llama
 ```
+
+## Validation and `gguf check`
+
+`gguf check FILE` is a read-only diagnostic that runs three layers of validation in order, merges the results, and prints them. It exits non-zero only if there are errors.
+
+1. **Format-level** — spec invariants from `validate_format` (currently: duplicate keys). Always on, can never be silenced.
+2. **Built-in suggestion schema** — embedded JSON with universal sanity checks (`general.architecture` required, `general.alignment` in 1..=4096, `general.quantization_version` in 1..=10, `general.file_type` is u32). All warnings; never blocks a save. Skip with `--no-default-schema`.
+3. **User-supplied `--schema PATH`** — your own JSON rules layered on top. Per-rule severity.
+
+A schema rule looks like:
+
+```json
+{
+  "version": 1,
+  "applies_to": [3],
+  "rules": {
+    "general.architecture": {
+      "type": "string",
+      "required": true,
+      "enum": ["llama", "mistral", "qwen"],
+      "severity": "error"
+    },
+    "llama.context_length": {
+      "type": "u32",
+      "min": 256, "max": 1048576,
+      "severity": "warning"
+    }
+  }
+}
+```
+
+Output tags: `[format-err ]`, `[schema-err ]`, `[schema-warn]`. Same checks run during editing commands' save flow — what `check` shows is what `set`/`add`/`rm`/`patch` would block on (modulo `--force` for schema errors).
 
 ## Design principles
 
@@ -63,11 +100,11 @@ The editor must keep working when the GGUF spec changes — without a rewrite. T
 - **Always verify version compatibility on open.** Every time a file is opened, the version field is read from the header and checked against the set of versions this build supports (currently `1, 2, 3`). Known version → proceed. Unknown version → fail loudly with the version number; never silently assume a newer version behaves like an older one.
 - **Validate before writing.** Every save runs constraint checks. Two layers, with different save-time behavior:
   1. *Format-level* (always enforced) — duplicate metadata keys are rejected. Other invariants (UTF-8 strings, type tags matching the encoded value, uniform array element types, count consistency) are guaranteed by the parser/encoder rather than by an explicit pass — the type system enforces them. Format-level failures **block the save unconditionally** — there is no `--force` override, because the result would not be a valid GGUF file and the failure would just move from save-time to load-time.
-  2. *Schema-level* (enforced when a schema overlay is loaded) — type spec match, enum membership, numeric `min`/`max`, string/array `min_length`/`max_length`. Each rule is tagged `warning` or `error` in the overlay:
+  2. *Schema-level* (enforced when a schema overlay is loaded) — type spec match, enum membership, numeric `min`/`max`, string/array `min_length`/`max_length`, and `required: true` for keys that should be present. Each rule is tagged `warning` or `error` in the overlay:
      - *warnings* show up in the preview/diff but do not block the save.
      - *errors* block the save by default, but are overridable with an explicit `--force` flag, since schemas can be wrong or out of date and the user may know something the overlay does not.
 
-     A missing overlay means no schema checks, not a bypass of the format checks.
+     A built-in suggestion schema ships with the editor (universal `general.*` rules, all `warning` severity). It runs automatically on `gguf check` and editing commands. Add your own with `--schema PATH`, or skip the built-in with `--no-default-schema` on `check`.
 - **Safe, atomic writes with two save paths.** GGUF files are gigabytes; a partial write loses the model. Every save goes through `write to temporary file → fsync → atomic rename over the original`, even trivial edits, so a crash never leaves the file half-written. The editor picks one of two paths automatically based on whether the new encoded header is the same size as the original `tensor_data_offset`:
   1. *Header overwrite* — the new metadata block fits within the existing header region (typical when the change is absorbed by the reserved padding budget). The temp is created via `std::fs::copy`, which uses `clonefile` on macOS APFS and `copy_file_range` with reflink on Linux Btrfs/XFS — on those filesystems tensor bytes are never physically read or written. On filesystems without copy-on-write (ext4, NTFS), `std::fs::copy` falls back to a regular byte copy. After the copy, only the header region is overwritten in place.
   2. *Full rewrite* — the size delta exceeds the padding budget. Tensor data must shift to a new offset. The whole file is streamed through `BufReader`/`BufWriter` chunks: header re-emitted, tensor-info offsets stay valid (they're relative to the tensor-data start), tensor data copied to the temp, then atomically renamed.
@@ -94,7 +131,7 @@ The result: a spec change at most requires updating an external schema file — 
 - **Big-endian parsing.** GGUF v3 added big-endian signaling; this editor currently rejects big-endian files. Adding endianness-aware reads is straightforward — branch on the byte order detected from the magic when parsing the version field.
 - **`--save-mode` flag** (`auto` / `rewrite` / `in-place`) — explicit user control over the save path. Currently the editor always picks the smallest sufficient path automatically.
 - **Token-id range validation** — format-level check that token-id metadata fields point inside the tokens array, when both are present.
-- **Richer schema rules** — regex patterns for strings, required-together fields, cross-field consistency. Currently only `type`, `enum`, `min`, `max`, `min_length`, `max_length` are supported.
+- **Richer schema rules** — regex patterns for strings, required-together fields, cross-field consistency. Currently supported: `type`, `enum`, `min`, `max`, `min_length`, `max_length`, `required`.
 - **Array editing in the CLI/TUI** — `set` and `add` currently reject array types and the TUI doesn't edit arrays. Use the `patch` command for array edits today.
 - **Provenance stamps** (opt-in `general.last_edited_by` / `general.last_edited_at`).
 - **Undo/redo within a session** — track the metadata state stack so the TUI can step back through edits.

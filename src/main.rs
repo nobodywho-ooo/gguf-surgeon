@@ -5,8 +5,8 @@ use anyhow::{Context, Result, bail};
 use clap::{Args, Parser, Subcommand};
 
 use gguf_surgeon::{
-    Diff, GgufArray, GgufFile, GgufValue, GgufValueType, Origin, SavePath, Schema, Severity,
-    Violation, apply_patch, builtin_schema, is_reserved_key, parse_patch,
+    Diff, GgufArray, GgufFile, GgufValue, GgufValueType, Origin, SaveMode, SavePath, Schema,
+    Severity, Violation, apply_patch, builtin_schema, is_reserved_key, parse_patch,
 };
 
 #[derive(Parser)]
@@ -19,6 +19,12 @@ struct Cli {
     /// Override schema-level errors and save anyway. Format-level errors are still unconditional.
     #[arg(long, global = true)]
     force: bool,
+
+    /// Save policy. `auto` (default) picks the cheapest sufficient path. `rewrite`
+    /// always does a full rewrite. `in-place` refuses any save that would force a
+    /// tensor-data shift (so you never accidentally pay a multi-gigabyte copy).
+    #[arg(long, global = true, value_enum, default_value_t = SaveMode::Auto)]
+    save_mode: SaveMode,
 
     #[command(subcommand)]
     cmd: Cmd,
@@ -159,6 +165,7 @@ fn main() -> Result<()> {
     let env = Env {
         schema: schema.as_ref(),
         force: cli.force,
+        save_mode: cli.save_mode,
     };
     match cli.cmd {
         Cmd::List {
@@ -190,7 +197,9 @@ fn main() -> Result<()> {
             file,
             no_default_schema,
         } => check(&file, env.schema, !no_default_schema)?,
-        Cmd::Edit { file } => gguf_surgeon::tui::run(&file, env.schema, env.force)?,
+        Cmd::Edit { file } => {
+            gguf_surgeon::tui::run(&file, env.schema, env.force, env.save_mode)?
+        }
         Cmd::Array(c) => array_dispatch(c.op, &env)?,
     }
     Ok(())
@@ -199,6 +208,7 @@ fn main() -> Result<()> {
 struct Env<'a> {
     schema: Option<&'a Schema>,
     force: bool,
+    save_mode: SaveMode,
 }
 
 fn list(path: &Path, max_value_width: usize) -> Result<()> {
@@ -415,7 +425,7 @@ fn finalize(
         print_violations(&violations);
     }
 
-    print_save_summary(path, &f)?;
+    print_save_summary(path, &f, env)?;
 
     let format_errors = violations
         .iter()
@@ -436,7 +446,7 @@ fn finalize(
         eprintln!("aborted, no changes written");
         return Ok(());
     }
-    f.write(path, path)?;
+    f.write(path, path, env.save_mode)?;
     Ok(())
 }
 
@@ -476,16 +486,22 @@ fn print_diff(diff: &Diff) {
     }
 }
 
-fn print_save_summary(path: &Path, after: &GgufFile) -> Result<()> {
+fn print_save_summary(path: &Path, after: &GgufFile, env: &Env) -> Result<()> {
     let size = std::fs::metadata(path)?.len();
-    let summary = match after.pick_save_path() {
-        SavePath::HeaderOverwrite => format!(
+    let predicted = after.pick_save_path();
+    let summary = match (env.save_mode, predicted) {
+        (SaveMode::Rewrite, _) => format!(
+            "full rewrite (forced by --save-mode=rewrite; will copy {size} bytes through a temp file)"
+        ),
+        (SaveMode::InPlace, SavePath::FullRewrite) => format!(
+            "WILL BE REFUSED — --save-mode=in-place but edit needs a full rewrite of {size} bytes"
+        ),
+        (_, SavePath::HeaderOverwrite) => format!(
             "header overwrite ({} byte header; tensor data left in place via copy-on-write where supported)",
             after.tensor_data_offset
         ),
-        SavePath::FullRewrite => format!(
-            "full rewrite (will copy {} bytes through a temp file)",
-            size
+        (_, SavePath::FullRewrite) => format!(
+            "full rewrite (will copy {size} bytes through a temp file)"
         ),
     };
     println!("save path: {summary}");

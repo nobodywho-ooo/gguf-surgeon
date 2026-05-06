@@ -84,7 +84,7 @@ fn ensure_padding_must_not_clobber_foreign_general_padding() {
         .position(|(k, _)| k == "general.architecture")
         .unwrap();
     f.metadata[arch_pos].1 = GgufValue::String("mistral".to_string());
-    f.write(&path, &path).unwrap();
+    f.write(&path, &path, gguf_surgeon::SaveMode::Auto).unwrap();
 
     // Re-read and verify the foreign string survived.
     let f2 = GgufFile::read(&path).unwrap();
@@ -121,5 +121,6 @@ fn tui_run_accepts_schema_and_force_for_validation() {
         &std::path::Path,
         Option<&gguf_surgeon::Schema>,
         bool,
+        gguf_surgeon::SaveMode,
     ) -> anyhow::Result<()> = gguf_surgeon::tui::run;
 }

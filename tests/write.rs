@@ -1,7 +1,7 @@
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
-use gguf_surgeon::{Error, GgufFile, GgufValue, GgufValueType, SavePath};
+use gguf_surgeon::{Error, GgufFile, GgufValue, GgufValueType, SaveMode, SavePath};
 
 fn put_str(b: &mut Vec<u8>, s: &[u8]) {
     b.extend_from_slice(&(s.len() as u64).to_le_bytes());
@@ -77,7 +77,7 @@ fn write_modifies_metadata_and_preserves_tensor_data() {
     f.metadata
         .push(("new.flag".to_string(), GgufValue::Bool(true)));
 
-    f.write(&src, &dst).unwrap();
+    f.write(&src, &dst, SaveMode::Auto).unwrap();
 
     let f2 = GgufFile::read(&dst).unwrap();
     assert_eq!(
@@ -115,7 +115,7 @@ fn write_in_place_replaces_original() {
     let answer = f.metadata.iter_mut().find(|(k, _)| k == "answer").unwrap();
     answer.1 = GgufValue::Uint32(7);
 
-    f.write(&path, &path).unwrap();
+    f.write(&path, &path, SaveMode::Auto).unwrap();
 
     let f2 = GgufFile::read(&path).unwrap();
     assert_eq!(
@@ -147,7 +147,7 @@ fn first_save_grows_file_to_install_padding() {
     answer.1 = GgufValue::Uint32(7);
 
     assert_eq!(f.pick_save_path(), SavePath::FullRewrite);
-    f.write(&path, &path).unwrap();
+    f.write(&path, &path, SaveMode::Auto).unwrap();
 
     let new_size = std::fs::metadata(&path).unwrap().len();
     assert!(new_size >= 64 * 1024);
@@ -163,7 +163,7 @@ fn padded_file_uses_header_overwrite_for_subsequent_same_size_edits() {
 
     // First save installs the padding.
     let mut f1 = GgufFile::read(&path).unwrap();
-    f1.write(&path, &path).unwrap();
+    f1.write(&path, &path, SaveMode::Auto).unwrap();
     let padded_size = std::fs::metadata(&path).unwrap().len();
 
     // Second save with same-size edit must stay header-overwrite.
@@ -173,7 +173,7 @@ fn padded_file_uses_header_overwrite_for_subsequent_same_size_edits() {
     answer.1 = GgufValue::Uint32(7);
 
     assert_eq!(f2.pick_save_path(), SavePath::HeaderOverwrite);
-    f2.write(&path, &path).unwrap();
+    f2.write(&path, &path, SaveMode::Auto).unwrap();
 
     let f3 = GgufFile::read(&path).unwrap();
     assert_eq!(f3.tensor_data_offset, original_tdo);
@@ -197,7 +197,7 @@ fn write_refuses_to_produce_a_file_with_duplicate_keys() {
     let dup_value = f.metadata[0].1.clone();
     f.metadata.push((dup_key.clone(), dup_value));
 
-    let err = f.write(&path, &path).unwrap_err();
+    let err = f.write(&path, &path, SaveMode::Auto).unwrap_err();
     assert!(
         matches!(err, Error::FormatViolation(_)),
         "expected FormatViolation, got {err:?}"
@@ -224,7 +224,7 @@ fn padded_file_uses_header_overwrite_for_small_size_changing_edits() {
 
     // First save installs padding.
     let mut f1 = GgufFile::read(&path).unwrap();
-    f1.write(&path, &path).unwrap();
+    f1.write(&path, &path, SaveMode::Auto).unwrap();
     let padded_size = std::fs::metadata(&path).unwrap().len();
 
     // Add a small key — fits inside the 64 KB slack budget, should stay header-overwrite.
@@ -233,7 +233,7 @@ fn padded_file_uses_header_overwrite_for_small_size_changing_edits() {
         .push(("small.new.key".to_string(), GgufValue::Uint32(123)));
 
     assert_eq!(f2.pick_save_path(), SavePath::HeaderOverwrite);
-    f2.write(&path, &path).unwrap();
+    f2.write(&path, &path, SaveMode::Auto).unwrap();
 
     let f3 = GgufFile::read(&path).unwrap();
     assert_eq!(std::fs::metadata(&path).unwrap().len(), padded_size);
@@ -244,5 +244,70 @@ fn padded_file_uses_header_overwrite_for_small_size_changing_edits() {
             .unwrap()
             .1,
         GgufValue::Uint32(123)
+    );
+}
+
+#[test]
+fn save_mode_in_place_refuses_size_changing_edit() {
+    let path = temp_path("inplace-refuse.gguf");
+    let _cleanup = Cleanup(vec![path.clone(), tmp_for(&path)]);
+    std::fs::write(&path, build_file_with_tensor_data()).unwrap();
+
+    let mut f = GgufFile::read(&path).unwrap();
+    // First save will install padding (size-changing). With SaveMode::InPlace this is refused.
+    let err = f.write(&path, &path, SaveMode::InPlace).unwrap_err();
+    assert!(matches!(err, Error::InPlaceRefused(_)), "expected InPlaceRefused, got {err:?}");
+
+    // The on-disk file is untouched.
+    assert!(!tmp_for(&path).exists(), "no temp file should be left behind");
+}
+
+#[test]
+fn save_mode_rewrite_forces_full_rewrite_path() {
+    let path = temp_path("force-rewrite.gguf");
+    let _cleanup = Cleanup(vec![path.clone(), tmp_for(&path)]);
+    std::fs::write(&path, build_file_with_tensor_data()).unwrap();
+
+    // Step 1: install padding so subsequent same-size edits are HeaderOverwrite-eligible.
+    let mut f1 = GgufFile::read(&path).unwrap();
+    f1.write(&path, &path, SaveMode::Auto).unwrap();
+    let padded_size = std::fs::metadata(&path).unwrap().len();
+
+    // Step 2: same-size edit. Auto would pick HeaderOverwrite. SaveMode::Rewrite overrides.
+    let mut f2 = GgufFile::read(&path).unwrap();
+    let answer = f2.metadata.iter_mut().find(|(k, _)| k == "answer").unwrap();
+    answer.1 = GgufValue::Uint32(42);
+    assert_eq!(f2.pick_save_path(), SavePath::HeaderOverwrite);
+
+    f2.write(&path, &path, SaveMode::Rewrite).unwrap();
+    // File still parses cleanly; size unchanged (rewrite produces equivalent output).
+    let f3 = GgufFile::read(&path).unwrap();
+    assert_eq!(
+        f3.metadata.iter().find(|(k, _)| k == "answer").unwrap().1,
+        GgufValue::Uint32(42)
+    );
+    assert_eq!(std::fs::metadata(&path).unwrap().len(), padded_size);
+}
+
+#[test]
+fn save_mode_in_place_succeeds_for_same_size_edit() {
+    let path = temp_path("inplace-ok.gguf");
+    let _cleanup = Cleanup(vec![path.clone(), tmp_for(&path)]);
+    std::fs::write(&path, build_file_with_tensor_data()).unwrap();
+
+    // First save (Auto) installs padding.
+    let mut f1 = GgufFile::read(&path).unwrap();
+    f1.write(&path, &path, SaveMode::Auto).unwrap();
+
+    // Second save: same-size edit + InPlace. Should succeed.
+    let mut f2 = GgufFile::read(&path).unwrap();
+    let answer = f2.metadata.iter_mut().find(|(k, _)| k == "answer").unwrap();
+    answer.1 = GgufValue::Uint32(99);
+    f2.write(&path, &path, SaveMode::InPlace).unwrap();
+
+    let f3 = GgufFile::read(&path).unwrap();
+    assert_eq!(
+        f3.metadata.iter().find(|(k, _)| k == "answer").unwrap().1,
+        GgufValue::Uint32(99)
     );
 }

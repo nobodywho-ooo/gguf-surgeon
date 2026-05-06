@@ -15,6 +15,23 @@ pub enum SavePath {
     FullRewrite,
 }
 
+/// User-controlled save policy. Default `Auto` picks the smallest sufficient path.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, clap::ValueEnum)]
+pub enum SaveMode {
+    /// Pick the cheapest path that works for the current edit (default).
+    #[default]
+    Auto,
+    /// Always do a full rewrite, even when a header-overwrite would suffice.
+    /// Useful for compacting accumulated padding or producing a clean fresh file.
+    Rewrite,
+    /// Refuse the save if it would require shifting tensor data. Useful when
+    /// disk space is tight or only fast saves are acceptable. Note: on
+    /// filesystems without copy-on-write (ext4/NTFS) the header-overwrite path
+    /// still copies tensor bytes via `std::fs::copy`; only the absolute tensor
+    /// offset is guaranteed not to change.
+    InPlace,
+}
+
 impl GgufFile {
     /// Predict which save path `write()` will take for the current state at the given
     /// padding step. Same encoded header size as the original `tensor_data_offset` → cheap
@@ -39,17 +56,25 @@ impl GgufFile {
     /// Atomic: writes to `<dest>.tmp`, fsyncs, then renames over `dest`.
     /// Also adjusts the `general.padding` sentinel so the encoded header rounds up to the
     /// default 64 KB slack budget — subsequent small edits then take the header-overwrite path.
-    pub fn write(&mut self, source: &Path, dest: &Path) -> Result<(), Error> {
+    /// `mode` controls which save path is allowed; see `SaveMode` for semantics.
+    pub fn write(&mut self, source: &Path, dest: &Path, mode: SaveMode) -> Result<(), Error> {
         // Refuse to write a file that would not load (e.g. duplicate keys). The CLI's
         // `finalize` already runs this check, but enforcing it here protects library
         // consumers and guarantees no path through `write` can produce an invalid file.
         self.check_format()?;
         self.ensure_padding(DEFAULT_PADDING_STEP);
         let header = self.encode_header();
-        if header.len() as u64 == self.tensor_data_offset {
-            self.write_header_overwrite(source, dest, &header)
-        } else {
-            self.write_full_rewrite(source, dest, &header)
+        let same_size = header.len() as u64 == self.tensor_data_offset;
+        match (mode, same_size) {
+            (SaveMode::InPlace, false) => Err(Error::InPlaceRefused(format!(
+                "edit would change the metadata block size (header is {} bytes, tensor data offset \
+                 is {}); pass --save-mode=auto or =rewrite to allow the tensor copy",
+                header.len(),
+                self.tensor_data_offset,
+            ))),
+            (SaveMode::Rewrite, _) => self.write_full_rewrite(source, dest, &header),
+            (_, true) => self.write_header_overwrite(source, dest, &header),
+            (_, false) => self.write_full_rewrite(source, dest, &header),
         }
     }
 

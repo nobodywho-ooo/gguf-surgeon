@@ -20,12 +20,18 @@ use ratatui::{
 
 use crate::diff::Diff;
 use crate::format::{GgufFile, is_reserved_key};
+use crate::save::SaveMode;
 use crate::schema::{Origin, Schema, Severity, Violation};
 use crate::value::{GgufValue, GgufValueType};
 
 const ARRAY_DETAIL_LIMIT: usize = 200;
 
-pub fn run(path: &Path, schema: Option<&Schema>, force: bool) -> Result<()> {
+pub fn run(
+    path: &Path,
+    schema: Option<&Schema>,
+    force: bool,
+    save_mode: SaveMode,
+) -> Result<()> {
     let file = GgufFile::read(path)?;
     let file_size = std::fs::metadata(path)?.len();
 
@@ -35,6 +41,7 @@ pub fn run(path: &Path, schema: Option<&Schema>, force: bool) -> Result<()> {
         file_size,
         schema.cloned(),
         force,
+        save_mode,
     );
 
     enable_raw_mode()?;
@@ -85,12 +92,16 @@ struct App {
     file_size: u64,
     schema: Option<Schema>,
     force: bool,
+    save_mode: SaveMode,
     visible: Vec<usize>,
     cursor: usize,
     list_state: TableState,
     mode: Mode,
     search_buf: String,
     status: Option<String>,
+    /// Cursor state for array editing. Shared between `ArrayList` and `ArrayInput`
+    /// so the cursor stays put while the user types into the input prompt.
+    array_list_state: TableState,
 }
 
 enum Mode {
@@ -102,9 +113,29 @@ enum Mode {
         buf: String,
         error: Option<String>,
     },
+    /// Browsing the elements of an array-valued metadata key.
+    ArrayList { parent_idx: usize },
+    /// Editing a single element, pushing, or inserting. The action determines
+    /// where the parsed value lands when the user hits Enter.
+    ArrayInput {
+        parent_idx: usize,
+        action: ArrayAction,
+        buf: String,
+        error: Option<String>,
+    },
     SaveConfirm,
     Saving,
     QuitConfirm,
+}
+
+#[derive(Debug, Clone, Copy)]
+enum ArrayAction {
+    /// Replace the element at the given index.
+    Edit(usize),
+    /// Append a new element to the end.
+    Push,
+    /// Insert a new element before the given index.
+    Insert(usize),
 }
 
 impl App {
@@ -114,6 +145,7 @@ impl App {
         file_size: u64,
         schema: Option<Schema>,
         force: bool,
+        save_mode: SaveMode,
     ) -> Self {
         let original_metadata = file.metadata.clone();
         let visible: Vec<usize> = file
@@ -134,12 +166,14 @@ impl App {
             file_size,
             schema,
             force,
+            save_mode,
             visible,
             cursor: 0,
             list_state,
             mode: Mode::List,
             search_buf: String::new(),
             status: None,
+            array_list_state: TableState::default(),
         }
     }
 
@@ -164,6 +198,8 @@ impl App {
             Mode::Search => Ok(self.handle_search(code)),
             Mode::Detail(_) => Ok(self.handle_detail(code)),
             Mode::Edit { .. } => Ok(self.handle_edit(code)),
+            Mode::ArrayList { .. } => Ok(self.handle_array_list(code)),
+            Mode::ArrayInput { .. } => Ok(self.handle_array_input(code)),
             Mode::SaveConfirm => self.handle_save_confirm(code),
             Mode::QuitConfirm => Ok(self.handle_quit_confirm(code)),
             // Mode::Saving runs synchronously in the main loop and never reads keys.
@@ -202,7 +238,8 @@ impl App {
                 if let Some(&idx) = self.visible.get(self.cursor) {
                     let (_, v) = &self.file.metadata[idx];
                     if matches!(v, GgufValue::Array(_)) {
-                        self.status = Some("array editing not supported in TUI".into());
+                        self.array_list_state.select(Some(0));
+                        self.mode = Mode::ArrayList { parent_idx: idx };
                     } else {
                         self.mode = Mode::Edit {
                             idx,
@@ -287,6 +324,153 @@ impl App {
         false
     }
 
+    fn handle_array_list(&mut self, code: KeyCode) -> bool {
+        let Mode::ArrayList { parent_idx } = self.mode else {
+            return false;
+        };
+        let arr_len = match &self.file.metadata[parent_idx].1 {
+            GgufValue::Array(a) => a.elements.len(),
+            _ => return false,
+        };
+        let cursor = self.array_list_state.selected().unwrap_or(0);
+        match code {
+            KeyCode::Esc | KeyCode::Char('q') => self.mode = Mode::List,
+            KeyCode::Char('j') | KeyCode::Down => {
+                if arr_len > 0 {
+                    let new = (cursor + 1).min(arr_len - 1);
+                    self.array_list_state.select(Some(new));
+                }
+            }
+            KeyCode::Char('k') | KeyCode::Up => {
+                self.array_list_state.select(Some(cursor.saturating_sub(1)));
+            }
+            KeyCode::Char('g') | KeyCode::Home => self.array_list_state.select(Some(0)),
+            KeyCode::Char('G') | KeyCode::End => {
+                if arr_len > 0 {
+                    self.array_list_state.select(Some(arr_len - 1));
+                }
+            }
+            KeyCode::PageDown => {
+                if arr_len > 0 {
+                    let new = (cursor + 10).min(arr_len - 1);
+                    self.array_list_state.select(Some(new));
+                }
+            }
+            KeyCode::PageUp => {
+                self.array_list_state.select(Some(cursor.saturating_sub(10)));
+            }
+            KeyCode::Char('e') | KeyCode::Enter => {
+                if let GgufValue::Array(a) = &self.file.metadata[parent_idx].1
+                    && let Some(elem) = a.elements.get(cursor)
+                {
+                    self.mode = Mode::ArrayInput {
+                        parent_idx,
+                        action: ArrayAction::Edit(cursor),
+                        buf: render_for_edit(elem),
+                        error: None,
+                    };
+                }
+            }
+            KeyCode::Char('a') => {
+                self.mode = Mode::ArrayInput {
+                    parent_idx,
+                    action: ArrayAction::Push,
+                    buf: String::new(),
+                    error: None,
+                };
+            }
+            KeyCode::Char('i') => {
+                self.mode = Mode::ArrayInput {
+                    parent_idx,
+                    action: ArrayAction::Insert(cursor),
+                    buf: String::new(),
+                    error: None,
+                };
+            }
+            KeyCode::Char('d') => {
+                if arr_len > 0
+                    && let GgufValue::Array(a) = &mut self.file.metadata[parent_idx].1
+                {
+                    a.elements.remove(cursor);
+                    let new_cursor = if a.elements.is_empty() {
+                        0
+                    } else {
+                        cursor.min(a.elements.len() - 1)
+                    };
+                    self.array_list_state.select(Some(new_cursor));
+                    self.status = Some("element removed (unsaved)".into());
+                }
+            }
+            _ => {}
+        }
+        false
+    }
+
+    fn handle_array_input(&mut self, code: KeyCode) -> bool {
+        let Mode::ArrayInput {
+            parent_idx,
+            action,
+            ref mut buf,
+            ref mut error,
+        } = self.mode
+        else {
+            return false;
+        };
+        match code {
+            KeyCode::Esc => {
+                self.mode = Mode::ArrayList { parent_idx };
+            }
+            KeyCode::Backspace => {
+                buf.pop();
+                *error = None;
+            }
+            KeyCode::Char(c) => {
+                buf.push(c);
+                *error = None;
+            }
+            KeyCode::Enter => {
+                let text = buf.clone();
+                let elem_type = match &self.file.metadata[parent_idx].1 {
+                    GgufValue::Array(a) => a.element_type,
+                    _ => return false,
+                };
+                match parse_value_for_type(&text, elem_type) {
+                    Ok(v) => {
+                        let GgufValue::Array(ref mut a) = self.file.metadata[parent_idx].1
+                        else {
+                            return false;
+                        };
+                        let final_cursor = match action {
+                            ArrayAction::Edit(idx) => {
+                                if idx < a.elements.len() {
+                                    a.elements[idx] = v;
+                                }
+                                idx
+                            }
+                            ArrayAction::Push => {
+                                a.elements.push(v);
+                                a.elements.len() - 1
+                            }
+                            ArrayAction::Insert(idx) => {
+                                let pos = idx.min(a.elements.len());
+                                a.elements.insert(pos, v);
+                                pos
+                            }
+                        };
+                        self.array_list_state.select(Some(final_cursor));
+                        self.mode = Mode::ArrayList { parent_idx };
+                        self.status = Some("element updated (unsaved)".into());
+                    }
+                    Err(e) => {
+                        *error = Some(e.to_string());
+                    }
+                }
+            }
+            _ => {}
+        }
+        false
+    }
+
     fn handle_save_confirm(&mut self, code: KeyCode) -> Result<bool> {
         match code {
             KeyCode::Char('y') | KeyCode::Char('Y') | KeyCode::Enter => {
@@ -326,14 +510,17 @@ impl App {
     }
 
     fn handle_paste(&mut self, text: &str) {
-        if let Mode::Edit { buf, error, .. } = &mut self.mode {
-            buf.push_str(text);
-            *error = None;
+        match &mut self.mode {
+            Mode::Edit { buf, error, .. } | Mode::ArrayInput { buf, error, .. } => {
+                buf.push_str(text);
+                *error = None;
+            }
+            _ => {}
         }
     }
 
     fn run_save(&mut self) -> Result<()> {
-        self.file.write(&self.path, &self.path)?;
+        self.file.write(&self.path, &self.path, self.save_mode)?;
         self.file_size = std::fs::metadata(&self.path)?.len();
         self.file = GgufFile::read(&self.path)
             .map_err(|e| anyhow!("could not re-read after save: {e}"))?;
@@ -443,7 +630,15 @@ fn draw(f: &mut ratatui::Frame, app: &mut App) {
         .split(f.area());
 
     draw_title(f, chunks[0], app);
-    draw_body(f, chunks[1], app);
+    let array_parent = match &app.mode {
+        Mode::ArrayList { parent_idx } | Mode::ArrayInput { parent_idx, .. } => Some(*parent_idx),
+        _ => None,
+    };
+    if let Some(parent_idx) = array_parent {
+        draw_body_array(f, chunks[1], app, parent_idx);
+    } else {
+        draw_body(f, chunks[1], app);
+    }
     draw_status(f, chunks[2], app);
 
     match &app.mode {
@@ -493,6 +688,28 @@ fn draw_body(f: &mut ratatui::Frame, area: Rect, app: &mut App) {
     f.render_stateful_widget(table, area, &mut app.list_state);
 }
 
+fn draw_body_array(f: &mut ratatui::Frame, area: Rect, app: &mut App, parent_idx: usize) {
+    let arr = match &app.file.metadata[parent_idx].1 {
+        GgufValue::Array(a) => a,
+        _ => return,
+    };
+    let rows: Vec<Row> = arr
+        .elements
+        .iter()
+        .enumerate()
+        .map(|(i, e)| {
+            Row::new(vec![
+                Cell::from(format!("[{i:>5}]")),
+                Cell::from(summarize(e, 120)),
+            ])
+        })
+        .collect();
+    let widths = [Constraint::Length(9), Constraint::Min(0)];
+    let table = Table::new(rows, widths)
+        .row_highlight_style(Style::default().add_modifier(Modifier::REVERSED));
+    f.render_stateful_widget(table, area, &mut app.array_list_state);
+}
+
 fn draw_status(f: &mut ratatui::Frame, area: Rect, app: &App) {
     let text = match &app.mode {
         Mode::List => {
@@ -515,6 +732,33 @@ fn draw_status(f: &mut ratatui::Frame, area: Rect, app: &App) {
         Mode::Edit { buf, error, .. } => {
             let display = render_edit_buffer(buf);
             let head = format!("edit: {display}_  [enter] apply  [esc] cancel");
+            match error {
+                Some(e) => format!("{head}    !{e}"),
+                None => head,
+            }
+        }
+        Mode::ArrayList { parent_idx } => {
+            let key = &app.file.metadata[*parent_idx].0;
+            let len = match &app.file.metadata[*parent_idx].1 {
+                GgufValue::Array(a) => a.elements.len(),
+                _ => 0,
+            };
+            let cursor = app.array_list_state.selected().unwrap_or(0);
+            let pos = if len == 0 {
+                "0 of 0".to_string()
+            } else {
+                format!("{} of {}", cursor + 1, len)
+            };
+            format!("array {key} [{pos}]  [e] edit  [a] append  [i] insert  [d] delete  [esc] back")
+        }
+        Mode::ArrayInput { action, buf, error, .. } => {
+            let label = match action {
+                ArrayAction::Edit(idx) => format!("edit [{idx}]"),
+                ArrayAction::Push => "push".to_string(),
+                ArrayAction::Insert(idx) => format!("insert before [{idx}]"),
+            };
+            let display = render_edit_buffer(buf);
+            let head = format!("array {label}: {display}_  [enter] apply  [esc] cancel");
             match error {
                 Some(e) => format!("{head}    !{e}"),
                 None => head,

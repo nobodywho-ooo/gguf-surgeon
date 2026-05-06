@@ -63,6 +63,10 @@ gguf edit MODEL.gguf
 
 # Validate against a schema overlay; --force overrides schema errors
 gguf --schema rules.json set MODEL.gguf general.architecture llama
+
+# Control the save path explicitly
+gguf --save-mode=rewrite  set MODEL.gguf general.author "me" -y   # always full rewrite
+gguf --save-mode=in-place set MODEL.gguf general.author "me" -y   # refuse if it would force tensor copy
 ```
 
 ## Validation and `gguf check`
@@ -136,9 +140,7 @@ The result: a spec change at most requires updating an external schema file — 
 ## Future work
 
 - **Linux-native in-place metadata growth.** When metadata grows beyond the reserved padding budget, the current fallback is a full rewrite (~2× peak disk usage during save, full read/write of the tensor data). On Linux with ext4 or XFS and a recent kernel, `fallocate(FALLOC_FL_INSERT_RANGE)` can shift the entire tensor-data region forward by a block-aligned delta as an O(1) filesystem-metadata operation — no tensor bytes are read or written, and disk usage barely changes. Adding this as a third save path would make unbounded metadata growth nearly free on supported systems. Constraints: Linux-only (no macOS/APFS, no Windows/NTFS support), 4 KB block-aligned only, not atomic on its own (needs a careful failure-recovery wrapper).
-- **`--save-mode` flag** (`auto` / `rewrite` / `in-place`) — explicit user control over the save path. Currently the editor always picks the smallest sufficient path automatically.
 - **Richer schema rules** — regex patterns for strings, required-together fields, cross-field consistency. Currently supported: `type`, `enum`, `min`, `max`, `min_length`, `max_length`, `required`.
-- **Array editing in the TUI** — `gguf array {set,push,pop,insert,remove}` already covers the CLI; the TUI's interactive editor still only handles scalars.
 - **Provenance stamps** (opt-in `general.last_edited_by` / `general.last_edited_at`).
 - **Undo/redo within a session** — track the metadata state stack so the TUI can step back through edits.
 - **TOML patches** alongside JSON.

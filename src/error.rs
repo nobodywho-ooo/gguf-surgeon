@@ -28,4 +28,7 @@ pub enum Error {
 
     #[error("format violation: {0}")]
     FormatViolation(String),
+
+    #[error("save refused by --save-mode=in-place: {0}")]
+    InPlaceRefused(String),
 }

@@ -40,6 +40,11 @@ fn padding_overhead(version: u32) -> u64 {
 #[derive(Debug, Clone)]
 pub struct GgufFile {
     pub version: u32,
+    /// File endianness. GGUF v3 added big-endian support; we detect at parse time
+    /// by reading the version field in both byte orders and picking the one whose
+    /// value falls in the supported set. Preserved on save so files round-trip in
+    /// their original byte order.
+    pub little_endian: bool,
     pub tensor_count: u64,
     pub metadata: Vec<(String, GgufValue)>,
     pub tensors: Vec<TensorInfo>,
@@ -81,6 +86,40 @@ pub fn is_reserved_key(key: &str) -> bool {
     key == PADDING_KEY
 }
 
+/// Tokenizer vocabulary array key.
+const TOKENS_KEY: &str = "tokenizer.ggml.tokens";
+
+/// Special-token-id metadata keys that, when present, must point to valid indices
+/// in `tokenizer.ggml.tokens`. Out-of-range or negative values pass parsing but
+/// crash generation in `llama.cpp`.
+const TOKEN_ID_KEYS: &[&str] = &[
+    "tokenizer.ggml.bos_token_id",
+    "tokenizer.ggml.eos_token_id",
+    "tokenizer.ggml.eot_token_id",
+    "tokenizer.ggml.eom_token_id",
+    "tokenizer.ggml.unknown_token_id",
+    "tokenizer.ggml.padding_token_id",
+    "tokenizer.ggml.cls_token_id",
+    "tokenizer.ggml.mask_token_id",
+    "tokenizer.ggml.separator_token_id",
+];
+
+/// Coerce a `GgufValue` to an i64 if it's an integer type. Returns None for
+/// non-integer types or unsigned values larger than i64::MAX.
+fn as_signed_index(v: &GgufValue) -> Option<i64> {
+    match v {
+        GgufValue::Uint8(n) => Some(i64::from(*n)),
+        GgufValue::Uint16(n) => Some(i64::from(*n)),
+        GgufValue::Uint32(n) => Some(i64::from(*n)),
+        GgufValue::Uint64(n) => i64::try_from(*n).ok(),
+        GgufValue::Int8(n) => Some(i64::from(*n)),
+        GgufValue::Int16(n) => Some(i64::from(*n)),
+        GgufValue::Int32(n) => Some(i64::from(*n)),
+        GgufValue::Int64(n) => Some(*n),
+        _ => None,
+    }
+}
+
 /// Detect a value that this editor (current or older) wrote as padding: a u8 array
 /// where every element is zero. Used at save time to decide whether the legacy
 /// `general.padding` key holds our slack or foreign data we must preserve.
@@ -118,14 +157,24 @@ impl GgufFile {
             return Err(Error::BadMagic(magic_bytes));
         }
 
-        let version = r.u32()?;
-        if !version::is_supported(version) {
+        // Detect endianness from the version field: try LE first, then BE. The first
+        // interpretation that lands on a known version wins. GGUF v3 added formal
+        // big-endian support; v1/v2 are accepted in either byte order for permissiveness.
+        let version_bytes: [u8; 4] = r.take(4)?.try_into().unwrap();
+        let v_le = u32::from_le_bytes(version_bytes);
+        let v_be = u32::from_be_bytes(version_bytes);
+        let (version, little_endian) = if version::is_supported(v_le) {
+            (v_le, true)
+        } else if version::is_supported(v_be) {
+            (v_be, false)
+        } else {
             return Err(Error::UnsupportedVersion {
-                found: version,
+                found: v_le,
                 supported: version::SUPPORTED_VERSIONS,
             });
-        }
+        };
         r.version = version;
+        r.little_endian = little_endian;
 
         let tensor_count = r.count()?;
         let kv_count = r.count()?;
@@ -164,6 +213,7 @@ impl GgufFile {
 
         Ok(GgufFile {
             version,
+            little_endian,
             tensor_count,
             metadata,
             tensors,
@@ -239,6 +289,44 @@ impl GgufFile {
                 });
             }
         }
+
+        // Token-id range check. When tokenizer.ggml.tokens is present and the file
+        // declares a special token id (BOS/EOS/UNK/PAD/...) that is negative or
+        // points past the end of the tokens array, llama.cpp loads the file but
+        // crashes at generation time. Catching it at save-time matches the README's
+        // "format-level → unconditional block" promise.
+        if let Some(tokens_len) = self
+            .metadata
+            .iter()
+            .find(|(k, _)| k == TOKENS_KEY)
+            .and_then(|(_, v)| match v {
+                GgufValue::Array(a) => Some(a.elements.len() as u64),
+                _ => None,
+            })
+        {
+            for &key in TOKEN_ID_KEYS {
+                if let Some((_, value)) = self.metadata.iter().find(|(k, _)| k == key) {
+                    match as_signed_index(value) {
+                        Some(id) if id < 0 => out.push(Violation {
+                            origin: Origin::Format,
+                            key: key.to_string(),
+                            severity: Severity::Error,
+                            message: format!("token id {id} is negative"),
+                        }),
+                        Some(id) if (id as u64) >= tokens_len => out.push(Violation {
+                            origin: Origin::Format,
+                            key: key.to_string(),
+                            severity: Severity::Error,
+                            message: format!(
+                                "token id {id} is out of range (tokens array has {tokens_len} elements)"
+                            ),
+                        }),
+                        _ => {}
+                    }
+                }
+            }
+        }
+
         out
     }
 
@@ -268,7 +356,7 @@ impl GgufFile {
     pub fn encode_header(&self) -> Vec<u8> {
         let mut out = Vec::new();
         {
-            let mut w = Writer::new(&mut out, self.version);
+            let mut w = Writer::new(&mut out, self.version, self.little_endian);
             w.bytes(MAGIC);
             w.u32(self.version);
             w.count(self.tensors.len() as u64);
@@ -302,6 +390,9 @@ struct Reader<'a> {
     /// 0 until the version field is read; then the file's declared version.
     /// Determines whether length prefixes are u32 (v1) or u64 (v2/v3).
     version: u32,
+    /// Set after detecting endianness from the version field. Determines whether
+    /// multi-byte primitives are decoded little- or big-endian.
+    little_endian: bool,
 }
 
 impl<'a> Reader<'a> {
@@ -310,6 +401,7 @@ impl<'a> Reader<'a> {
             data,
             pos: 0,
             version: 0,
+            little_endian: true,
         }
     }
 
@@ -347,28 +439,36 @@ impl<'a> Reader<'a> {
         Ok(self.take(1)?[0] as i8)
     }
     fn u16(&mut self) -> Result<u16, Error> {
-        Ok(u16::from_le_bytes(self.take(2)?.try_into().unwrap()))
+        let b: [u8; 2] = self.take(2)?.try_into().unwrap();
+        Ok(if self.little_endian { u16::from_le_bytes(b) } else { u16::from_be_bytes(b) })
     }
     fn i16(&mut self) -> Result<i16, Error> {
-        Ok(i16::from_le_bytes(self.take(2)?.try_into().unwrap()))
+        let b: [u8; 2] = self.take(2)?.try_into().unwrap();
+        Ok(if self.little_endian { i16::from_le_bytes(b) } else { i16::from_be_bytes(b) })
     }
     fn u32(&mut self) -> Result<u32, Error> {
-        Ok(u32::from_le_bytes(self.take(4)?.try_into().unwrap()))
+        let b: [u8; 4] = self.take(4)?.try_into().unwrap();
+        Ok(if self.little_endian { u32::from_le_bytes(b) } else { u32::from_be_bytes(b) })
     }
     fn i32(&mut self) -> Result<i32, Error> {
-        Ok(i32::from_le_bytes(self.take(4)?.try_into().unwrap()))
+        let b: [u8; 4] = self.take(4)?.try_into().unwrap();
+        Ok(if self.little_endian { i32::from_le_bytes(b) } else { i32::from_be_bytes(b) })
     }
     fn u64(&mut self) -> Result<u64, Error> {
-        Ok(u64::from_le_bytes(self.take(8)?.try_into().unwrap()))
+        let b: [u8; 8] = self.take(8)?.try_into().unwrap();
+        Ok(if self.little_endian { u64::from_le_bytes(b) } else { u64::from_be_bytes(b) })
     }
     fn i64(&mut self) -> Result<i64, Error> {
-        Ok(i64::from_le_bytes(self.take(8)?.try_into().unwrap()))
+        let b: [u8; 8] = self.take(8)?.try_into().unwrap();
+        Ok(if self.little_endian { i64::from_le_bytes(b) } else { i64::from_be_bytes(b) })
     }
     fn f32(&mut self) -> Result<f32, Error> {
-        Ok(f32::from_le_bytes(self.take(4)?.try_into().unwrap()))
+        let b: [u8; 4] = self.take(4)?.try_into().unwrap();
+        Ok(if self.little_endian { f32::from_le_bytes(b) } else { f32::from_be_bytes(b) })
     }
     fn f64(&mut self) -> Result<f64, Error> {
-        Ok(f64::from_le_bytes(self.take(8)?.try_into().unwrap()))
+        let b: [u8; 8] = self.take(8)?.try_into().unwrap();
+        Ok(if self.little_endian { f64::from_le_bytes(b) } else { f64::from_be_bytes(b) })
     }
     fn bool_(&mut self) -> Result<bool, Error> {
         Ok(self.u8()? != 0)
@@ -465,11 +565,12 @@ fn value_encoded_size(v: &GgufValue, version: u32) -> u64 {
 struct Writer<'a> {
     out: &'a mut Vec<u8>,
     version: u32,
+    little_endian: bool,
 }
 
 impl<'a> Writer<'a> {
-    fn new(out: &'a mut Vec<u8>, version: u32) -> Self {
-        Self { out, version }
+    fn new(out: &'a mut Vec<u8>, version: u32, little_endian: bool) -> Self {
+        Self { out, version, little_endian }
     }
 
     fn count(&mut self, n: u64) {
@@ -488,31 +589,31 @@ impl<'a> Writer<'a> {
         self.out.push(v);
     }
     fn u16(&mut self, v: u16) {
-        self.out.extend_from_slice(&v.to_le_bytes());
+        self.out.extend_from_slice(&if self.little_endian { v.to_le_bytes() } else { v.to_be_bytes() });
     }
     fn u32(&mut self, v: u32) {
-        self.out.extend_from_slice(&v.to_le_bytes());
+        self.out.extend_from_slice(&if self.little_endian { v.to_le_bytes() } else { v.to_be_bytes() });
     }
     fn u64(&mut self, v: u64) {
-        self.out.extend_from_slice(&v.to_le_bytes());
+        self.out.extend_from_slice(&if self.little_endian { v.to_le_bytes() } else { v.to_be_bytes() });
     }
     fn i8_(&mut self, v: i8) {
         self.out.push(v as u8);
     }
     fn i16(&mut self, v: i16) {
-        self.out.extend_from_slice(&v.to_le_bytes());
+        self.out.extend_from_slice(&if self.little_endian { v.to_le_bytes() } else { v.to_be_bytes() });
     }
     fn i32(&mut self, v: i32) {
-        self.out.extend_from_slice(&v.to_le_bytes());
+        self.out.extend_from_slice(&if self.little_endian { v.to_le_bytes() } else { v.to_be_bytes() });
     }
     fn i64(&mut self, v: i64) {
-        self.out.extend_from_slice(&v.to_le_bytes());
+        self.out.extend_from_slice(&if self.little_endian { v.to_le_bytes() } else { v.to_be_bytes() });
     }
     fn f32(&mut self, v: f32) {
-        self.out.extend_from_slice(&v.to_le_bytes());
+        self.out.extend_from_slice(&if self.little_endian { v.to_le_bytes() } else { v.to_be_bytes() });
     }
     fn f64(&mut self, v: f64) {
-        self.out.extend_from_slice(&v.to_le_bytes());
+        self.out.extend_from_slice(&if self.little_endian { v.to_le_bytes() } else { v.to_be_bytes() });
     }
     fn bool_(&mut self, v: bool) {
         self.out.push(u8::from(v));
@@ -762,6 +863,7 @@ mod tests {
     fn validate_format_detects_duplicate_keys() {
         let f = GgufFile {
             version: 3,
+            little_endian: true,
             tensor_count: 0,
             metadata: vec![
                 ("a".to_string(), GgufValue::Uint32(1)),
@@ -784,6 +886,7 @@ mod tests {
     fn validate_format_passes_unique_keys() {
         let f = GgufFile {
             version: 3,
+            little_endian: true,
             tensor_count: 0,
             metadata: vec![
                 ("a".to_string(), GgufValue::Uint32(1)),
@@ -838,6 +941,7 @@ mod tests {
     fn check_format_returns_error_for_duplicate_keys() {
         let f = GgufFile {
             version: 3,
+            little_endian: true,
             tensor_count: 0,
             metadata: vec![
                 ("a".to_string(), GgufValue::Uint32(1)),
@@ -856,6 +960,7 @@ mod tests {
     fn check_format_passes_clean_file() {
         let f = GgufFile {
             version: 3,
+            little_endian: true,
             tensor_count: 0,
             metadata: vec![("a".to_string(), GgufValue::Uint32(1))],
             tensors: vec![],
@@ -961,6 +1066,158 @@ mod tests {
         };
         assert_eq!(arr.elements.len(), 3);
         assert_eq!(arr.elements[2], GgufValue::Uint32(30));
+    }
+
+    fn file_with_tokens_and_special_id(
+        n_tokens: usize,
+        special_key: &str,
+        id: GgufValue,
+    ) -> GgufFile {
+        let elements = (0..n_tokens)
+            .map(|i| GgufValue::String(format!("tok{i}")))
+            .collect::<Vec<_>>();
+        GgufFile {
+            version: 3,
+            little_endian: true,
+            tensor_count: 0,
+            metadata: vec![
+                (
+                    TOKENS_KEY.to_string(),
+                    GgufValue::Array(GgufArray {
+                        element_type: GgufValueType::String,
+                        elements,
+                    }),
+                ),
+                (special_key.to_string(), id),
+            ],
+            tensors: vec![],
+            alignment: 32,
+            header_end: 0,
+            tensor_data_offset: 0,
+        }
+    }
+
+    #[test]
+    fn validate_format_passes_in_range_token_id() {
+        let f = file_with_tokens_and_special_id(
+            128,
+            "tokenizer.ggml.eos_token_id",
+            GgufValue::Uint32(42),
+        );
+        assert!(f.validate_format().is_empty());
+    }
+
+    #[test]
+    fn validate_format_flags_out_of_range_token_id() {
+        let f = file_with_tokens_and_special_id(
+            128,
+            "tokenizer.ggml.eos_token_id",
+            GgufValue::Uint32(500),
+        );
+        let v = f.validate_format();
+        assert_eq!(v.len(), 1);
+        assert_eq!(v[0].origin, Origin::Format);
+        assert_eq!(v[0].severity, Severity::Error);
+        assert!(v[0].message.contains("out of range"));
+    }
+
+    #[test]
+    fn validate_format_flags_negative_token_id() {
+        let f = file_with_tokens_and_special_id(
+            128,
+            "tokenizer.ggml.bos_token_id",
+            GgufValue::Int32(-1),
+        );
+        let v = f.validate_format();
+        assert_eq!(v.len(), 1);
+        assert!(v[0].message.contains("negative"));
+    }
+
+    #[test]
+    fn validate_format_skips_token_id_check_without_tokens_array() {
+        let f = GgufFile {
+            version: 3,
+            little_endian: true,
+            tensor_count: 0,
+            metadata: vec![(
+                "tokenizer.ggml.eos_token_id".to_string(),
+                GgufValue::Uint32(99999),
+            )],
+            tensors: vec![],
+            alignment: 32,
+            header_end: 0,
+            tensor_data_offset: 0,
+        };
+        // Without the tokens array we can't check; this should NOT produce a
+        // violation (we're permissive about partial tokenizer metadata).
+        assert!(f.validate_format().is_empty());
+    }
+
+    #[test]
+    fn parses_big_endian_v3_file() {
+        // Hand-build a v3 BE file: same layout as LE but every multi-byte integer
+        // is in big-endian byte order.
+        let mut b = Vec::new();
+        b.extend_from_slice(b"GGUF");
+        b.extend_from_slice(&3u32.to_be_bytes());
+        b.extend_from_slice(&0u64.to_be_bytes()); // tensor_count
+        b.extend_from_slice(&1u64.to_be_bytes()); // kv_count
+        // kv: ("answer", uint32, 42)
+        let key = b"answer";
+        b.extend_from_slice(&(key.len() as u64).to_be_bytes());
+        b.extend_from_slice(key);
+        b.extend_from_slice(&(GgufValueType::Uint32 as u32).to_be_bytes());
+        b.extend_from_slice(&42u32.to_be_bytes());
+
+        let f = GgufFile::parse(&b).expect("parse BE");
+        assert_eq!(f.version, 3);
+        assert!(!f.little_endian, "endianness must be detected as big-endian");
+        assert_eq!(f.metadata.len(), 1);
+        assert_eq!(f.metadata[0].0, "answer");
+        assert_eq!(f.metadata[0].1, GgufValue::Uint32(42));
+    }
+
+    #[test]
+    fn big_endian_round_trip_preserves_byte_order() {
+        let mut original = Vec::new();
+        original.extend_from_slice(b"GGUF");
+        original.extend_from_slice(&3u32.to_be_bytes());
+        original.extend_from_slice(&0u64.to_be_bytes());
+        original.extend_from_slice(&1u64.to_be_bytes());
+        let key = b"k";
+        original.extend_from_slice(&(key.len() as u64).to_be_bytes());
+        original.extend_from_slice(key);
+        original.extend_from_slice(&(GgufValueType::Uint32 as u32).to_be_bytes());
+        original.extend_from_slice(&7u32.to_be_bytes());
+        let pad = (32 - original.len() % 32) % 32;
+        original.extend(std::iter::repeat_n(0u8, pad));
+
+        let f = GgufFile::parse(&original).expect("parse BE");
+        assert!(!f.little_endian);
+        let encoded = f.encode_header();
+        assert_eq!(
+            encoded, original,
+            "BE round-trip must preserve byte-for-byte layout"
+        );
+
+        // And the re-parsed file must still report BE.
+        let f2 = GgufFile::parse(&encoded).expect("re-parse BE");
+        assert!(!f2.little_endian);
+        assert_eq!(f2.metadata, f.metadata);
+    }
+
+    #[test]
+    fn endianness_detection_falls_back_correctly() {
+        // A v3 LE file's version field reads as 3 in LE. The BE interpretation would
+        // be 50_331_648 (0x03000000) — not in SUPPORTED_VERSIONS, so the parser must
+        // pick LE.
+        let mut b = Vec::new();
+        b.extend_from_slice(b"GGUF");
+        b.extend_from_slice(&3u32.to_le_bytes());
+        b.extend_from_slice(&0u64.to_le_bytes());
+        b.extend_from_slice(&0u64.to_le_bytes());
+        let f = GgufFile::parse(&b).expect("parse LE");
+        assert!(f.little_endian);
     }
 
     #[test]

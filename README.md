@@ -25,9 +25,9 @@ The editor is implemented in **Rust**. The language fits the constraints directl
 - **Type-tag dispatch with exhaustive matching.** GGUF's value-type enum maps to a Rust `enum`; `match` is checked at compile time, so a new primitive type added later is a hard compiler error rather than a silent fall-through.
 - **Cross-platform single binary.** Same codebase for Linux, macOS, and Windows; one static binary per platform makes distribution painless.
 
-The editor exposes both interaction modes from the same binary: a **CLI** with subcommands `list`, `get`, `set`, `add`, `rm`, `patch`, `info`, `check`, and `edit` for one-shot and scripted use, and a **TUI** built with `ratatui` (`gguf edit`) for interactive browsing and scalar editing. GGUF files almost always live on remote ML servers reachable only over SSH, so a terminal-native tool fits the audience; a graphical desktop UI is out of scope for the first release.
+The editor exposes both interaction modes from the same binary: a **CLI** with subcommands `list`, `get`, `set`, `add`, `rm`, `patch`, `info`, `check`, `array`, and `edit` for one-shot and scripted use, and a **TUI** built with `ratatui` (`gguf edit`) for interactive browsing and scalar editing. GGUF files almost always live on remote ML servers reachable only over SSH, so a terminal-native tool fits the audience; a graphical desktop UI is out of scope for the first release.
 
-**Supported GGUF versions: 1, 2, and 3** (little-endian). v1 used u32 length prefixes (deprecated in `llama.cpp`); v2 promoted them to u64; v3 is v2's binary layout with big-endian signaling added (big-endian parsing itself is future work). Files round-trip in their original version on save. Unknown versions fail loudly at open time.
+**Supported GGUF versions: 1, 2, and 3**, in both little- and big-endian. v1 used u32 length prefixes (deprecated in `llama.cpp`); v2 promoted them to u64; v3 added formal big-endian support. Endianness is detected automatically by trying the version field in both byte orders. Files round-trip in their original version and byte order on save. Unknown versions fail loudly at open time.
 
 ## Usage
 
@@ -41,6 +41,14 @@ gguf get  MODEL.gguf general.architecture
 gguf set MODEL.gguf general.architecture mistral -y
 gguf add MODEL.gguf general.author string "vag.gergo" -y
 gguf rm  MODEL.gguf outdated.key -y
+
+# Edit array values element by element
+gguf array len    MODEL.gguf tokenizer.ggml.tokens
+gguf array push   MODEL.gguf tokenizer.ggml.tokens "<|new_token|>" -y
+gguf array set    MODEL.gguf tokenizer.ggml.tokens 5 "<|fixed|>" -y
+gguf array insert MODEL.gguf tokenizer.ggml.tokens 0 "<|first|>" -y
+gguf array remove MODEL.gguf tokenizer.ggml.tokens 42 -y
+gguf array pop    MODEL.gguf tokenizer.ggml.tokens -y
 
 # Batch edits in one save (JSON patch)
 gguf patch MODEL.gguf changes.json -y
@@ -99,7 +107,7 @@ The editor must keep working when the GGUF spec changes — without a rewrite. T
 - **Schema overlay is optional and external.** Any "this key should be a non-empty string", "this key is an enum of these values", or "render this as a chat template" knowledge lives in a swappable JSON schema file, not in the code. Updating for a new spec version means dropping in a new schema file. Each overlay declares the GGUF version range it applies to. The overlay file format itself has a defined schema and is validated on load: a malformed overlay is rejected, never silently ignored.
 - **Always verify version compatibility on open.** Every time a file is opened, the version field is read from the header and checked against the set of versions this build supports (currently `1, 2, 3`). Known version → proceed. Unknown version → fail loudly with the version number; never silently assume a newer version behaves like an older one.
 - **Validate before writing.** Every save runs constraint checks. Two layers, with different save-time behavior:
-  1. *Format-level* (always enforced) — duplicate metadata keys are rejected. Other invariants (UTF-8 strings, type tags matching the encoded value, uniform array element types, count consistency) are guaranteed by the parser/encoder rather than by an explicit pass — the type system enforces them. Format-level failures **block the save unconditionally** — there is no `--force` override, because the result would not be a valid GGUF file and the failure would just move from save-time to load-time.
+  1. *Format-level* (always enforced) — duplicate metadata keys are rejected; special token-id keys (`tokenizer.ggml.bos_token_id`, `eos_token_id`, etc.) must point inside the `tokenizer.ggml.tokens` array if both are present, otherwise generation crashes at runtime in `llama.cpp`. Other invariants (UTF-8 strings, type tags matching the encoded value, uniform array element types, count consistency) are guaranteed by the parser/encoder rather than by an explicit pass — the type system enforces them. Format-level failures **block the save unconditionally** — there is no `--force` override, because the result would not be a valid GGUF file and the failure would just move from save-time to load-time.
   2. *Schema-level* (enforced when a schema overlay is loaded) — type spec match, enum membership, numeric `min`/`max`, string/array `min_length`/`max_length`, and `required: true` for keys that should be present. Each rule is tagged `warning` or `error` in the overlay:
      - *warnings* show up in the preview/diff but do not block the save.
      - *errors* block the save by default, but are overridable with an explicit `--force` flag, since schemas can be wrong or out of date and the user may know something the overlay does not.
@@ -117,9 +125,9 @@ The result: a spec change at most requires updating an external schema file — 
 
 ## Scope
 
-- Read and write GGUF v1, v2, and v3 (little-endian).
+- Read and write GGUF v1, v2, and v3, in both little- and big-endian.
 - Preserve tensor data, alignment, and padding exactly.
-- Edit scalar values (integers, floats, bools, strings) via CLI (`set`, `add`) or TUI. Edit array values (tokenizer vocabulary, merges) via the `patch` JSON command.
+- Edit scalar values (integers, floats, bools, strings) via CLI (`set`, `add`) or TUI. Edit array values (tokenizer vocabulary, merges) element-by-element via `gguf array {set,push,pop,insert,remove,len}`, or as a whole via the `patch` JSON command.
 - Treat custom and arbitrary keys as first-class. Any key name in any namespace can be listed, edited, added, or removed. Well-known keys get no special privileges; unknown keys get no special restrictions. The optional schema overlay only affects display and validation hints — its absence never blocks editing.
 - Round-trip safety: re-saving an unedited file produces a byte-identical output, even for files containing keys or types the editor has never seen before.
 - Preview before save: every save shows a diff (added, removed, and changed keys, with old → new values), names which save path will be taken (header overwrite or full rewrite), and waits for confirmation.
@@ -128,11 +136,9 @@ The result: a spec change at most requires updating an external schema file — 
 ## Future work
 
 - **Linux-native in-place metadata growth.** When metadata grows beyond the reserved padding budget, the current fallback is a full rewrite (~2× peak disk usage during save, full read/write of the tensor data). On Linux with ext4 or XFS and a recent kernel, `fallocate(FALLOC_FL_INSERT_RANGE)` can shift the entire tensor-data region forward by a block-aligned delta as an O(1) filesystem-metadata operation — no tensor bytes are read or written, and disk usage barely changes. Adding this as a third save path would make unbounded metadata growth nearly free on supported systems. Constraints: Linux-only (no macOS/APFS, no Windows/NTFS support), 4 KB block-aligned only, not atomic on its own (needs a careful failure-recovery wrapper).
-- **Big-endian parsing.** GGUF v3 added big-endian signaling; this editor currently rejects big-endian files. Adding endianness-aware reads is straightforward — branch on the byte order detected from the magic when parsing the version field.
 - **`--save-mode` flag** (`auto` / `rewrite` / `in-place`) — explicit user control over the save path. Currently the editor always picks the smallest sufficient path automatically.
-- **Token-id range validation** — format-level check that token-id metadata fields point inside the tokens array, when both are present.
 - **Richer schema rules** — regex patterns for strings, required-together fields, cross-field consistency. Currently supported: `type`, `enum`, `min`, `max`, `min_length`, `max_length`, `required`.
-- **Array editing in the CLI/TUI** — `set` and `add` currently reject array types and the TUI doesn't edit arrays. Use the `patch` command for array edits today.
+- **Array editing in the TUI** — `gguf array {set,push,pop,insert,remove}` already covers the CLI; the TUI's interactive editor still only handles scalars.
 - **Provenance stamps** (opt-in `general.last_edited_by` / `general.last_edited_at`).
 - **Undo/redo within a session** — track the metadata state stack so the TUI can step back through edits.
 - **TOML patches** alongside JSON.

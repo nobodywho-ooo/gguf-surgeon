@@ -198,6 +198,7 @@ mod tests {
     fn applies_set_add_rm_in_order() {
         let mut f = GgufFile {
             version: 3,
+            little_endian: true,
             tensor_count: 0,
             metadata: vec![
                 ("a".to_string(), GgufValue::Uint32(1)),
@@ -236,6 +237,7 @@ mod tests {
     fn rejects_out_of_range_integer() {
         let mut f = GgufFile {
             version: 3,
+            little_endian: true,
             tensor_count: 0,
             metadata: vec![("a".to_string(), GgufValue::Uint8(0))],
             tensors: vec![],
@@ -251,6 +253,7 @@ mod tests {
     fn rejects_set_on_missing_key() {
         let mut f = GgufFile {
             version: 3,
+            little_endian: true,
             tensor_count: 0,
             metadata: vec![],
             tensors: vec![],
@@ -265,6 +268,7 @@ mod tests {
     fn empty_file() -> GgufFile {
         GgufFile {
             version: 3,
+            little_endian: true,
             tensor_count: 0,
             metadata: vec![],
             tensors: vec![],

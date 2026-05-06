@@ -2,11 +2,11 @@ use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, bail};
-use clap::{Parser, Subcommand};
+use clap::{Args, Parser, Subcommand};
 
 use gguf_surgeon::{
-    Diff, GgufFile, GgufValue, GgufValueType, Origin, SavePath, Schema, Severity, Violation,
-    apply_patch, builtin_schema, is_reserved_key, parse_patch,
+    Diff, GgufArray, GgufFile, GgufValue, GgufValueType, Origin, SavePath, Schema, Severity,
+    Violation, apply_patch, builtin_schema, is_reserved_key, parse_patch,
 };
 
 #[derive(Parser)]
@@ -92,6 +92,61 @@ enum Cmd {
     },
     /// Open the file in an interactive TUI browser.
     Edit { file: PathBuf },
+    /// Edit array-valued metadata entries (set/push/pop/insert/remove/len).
+    Array(ArrayCmd),
+}
+
+#[derive(Args)]
+struct ArrayCmd {
+    #[command(subcommand)]
+    op: ArrayOp,
+}
+
+#[derive(Subcommand)]
+enum ArrayOp {
+    /// Replace the element at INDEX of an array-valued KEY.
+    Set {
+        file: PathBuf,
+        key: String,
+        index: usize,
+        value: String,
+        #[arg(short = 'y', long)]
+        yes: bool,
+    },
+    /// Append VALUE to the end of an array-valued KEY.
+    Push {
+        file: PathBuf,
+        key: String,
+        value: String,
+        #[arg(short = 'y', long)]
+        yes: bool,
+    },
+    /// Remove the last element of an array-valued KEY.
+    Pop {
+        file: PathBuf,
+        key: String,
+        #[arg(short = 'y', long)]
+        yes: bool,
+    },
+    /// Insert VALUE at INDEX of an array-valued KEY (existing elements shift right).
+    Insert {
+        file: PathBuf,
+        key: String,
+        index: usize,
+        value: String,
+        #[arg(short = 'y', long)]
+        yes: bool,
+    },
+    /// Remove the element at INDEX of an array-valued KEY (later elements shift left).
+    Remove {
+        file: PathBuf,
+        key: String,
+        index: usize,
+        #[arg(short = 'y', long)]
+        yes: bool,
+    },
+    /// Print the length of an array-valued KEY (read-only).
+    Len { file: PathBuf, key: String },
 }
 
 fn main() -> Result<()> {
@@ -136,6 +191,7 @@ fn main() -> Result<()> {
             no_default_schema,
         } => check(&file, env.schema, !no_default_schema)?,
         Cmd::Edit { file } => gguf_surgeon::tui::run(&file, env.schema, env.force)?,
+        Cmd::Array(c) => array_dispatch(c.op, &env)?,
     }
     Ok(())
 }
@@ -444,6 +500,127 @@ fn confirm_prompt() -> Result<bool> {
     Ok(matches!(input.trim().to_lowercase().as_str(), "y" | "yes"))
 }
 
+fn array_dispatch(op: ArrayOp, env: &Env) -> Result<()> {
+    match op {
+        ArrayOp::Set {
+            file,
+            key,
+            index,
+            value,
+            yes,
+        } => array_mutate(&file, &key, env, yes, |arr| {
+            check_index(arr, index)?;
+            let new_elem = parse_value(&value, arr.element_type)
+                .with_context(|| format!("could not parse value as {}", arr.element_type.as_str()))?;
+            arr.elements[index] = new_elem;
+            Ok(())
+        }),
+        ArrayOp::Push {
+            file,
+            key,
+            value,
+            yes,
+        } => array_mutate(&file, &key, env, yes, |arr| {
+            let new_elem = parse_value(&value, arr.element_type)
+                .with_context(|| format!("could not parse value as {}", arr.element_type.as_str()))?;
+            arr.elements.push(new_elem);
+            Ok(())
+        }),
+        ArrayOp::Pop { file, key, yes } => array_mutate(&file, &key, env, yes, |arr| {
+            if arr.elements.pop().is_none() {
+                bail!("array is already empty");
+            }
+            Ok(())
+        }),
+        ArrayOp::Insert {
+            file,
+            key,
+            index,
+            value,
+            yes,
+        } => array_mutate(&file, &key, env, yes, |arr| {
+            if index > arr.elements.len() {
+                bail!(
+                    "index {index} out of bounds for insert (length is {})",
+                    arr.elements.len()
+                );
+            }
+            let new_elem = parse_value(&value, arr.element_type)
+                .with_context(|| format!("could not parse value as {}", arr.element_type.as_str()))?;
+            arr.elements.insert(index, new_elem);
+            Ok(())
+        }),
+        ArrayOp::Remove {
+            file,
+            key,
+            index,
+            yes,
+        } => array_mutate(&file, &key, env, yes, |arr| {
+            check_index(arr, index)?;
+            arr.elements.remove(index);
+            Ok(())
+        }),
+        ArrayOp::Len { file, key } => {
+            let f = GgufFile::read(&file)?;
+            let arr = find_array(&f, &key)?;
+            println!("{}", arr.elements.len());
+            Ok(())
+        }
+    }
+}
+
+fn check_index(arr: &GgufArray, index: usize) -> Result<()> {
+    if index >= arr.elements.len() {
+        bail!(
+            "index {index} out of bounds for array of length {}",
+            arr.elements.len()
+        );
+    }
+    Ok(())
+}
+
+fn find_array<'a>(f: &'a GgufFile, key: &str) -> Result<&'a GgufArray> {
+    let entry = f
+        .metadata
+        .iter()
+        .find(|(k, _)| k == key)
+        .with_context(|| format!("key not found: {key}"))?;
+    match &entry.1 {
+        GgufValue::Array(a) => Ok(a),
+        other => bail!(
+            "key {key} is not an array (it is a {})",
+            other.ty().as_str()
+        ),
+    }
+}
+
+fn array_mutate(
+    path: &Path,
+    key: &str,
+    env: &Env,
+    yes: bool,
+    op: impl FnOnce(&mut GgufArray) -> Result<()>,
+) -> Result<()> {
+    if is_reserved_key(key) {
+        bail!("`{key}` is managed automatically by the editor; cannot be edited");
+    }
+    let mut f = GgufFile::read(path)?;
+    let pos = f
+        .metadata
+        .iter()
+        .position(|(k, _)| k == key)
+        .with_context(|| format!("key not found: {key}"))?;
+    let before = f.metadata.clone();
+    let GgufValue::Array(ref mut arr) = f.metadata[pos].1 else {
+        bail!(
+            "key {key} is not an array (it is a {})",
+            f.metadata[pos].1.ty().as_str()
+        );
+    };
+    op(arr)?;
+    finalize(path, f, &before, yes, env)
+}
+
 fn check(path: &Path, user_schema: Option<&Schema>, use_default: bool) -> Result<()> {
     let f = GgufFile::read(path)?;
 
@@ -486,7 +663,10 @@ fn info(path: &Path) -> Result<()> {
     println!("file:                {}", path.display());
     println!("size (bytes):        {file_size}");
     println!("version:             {}", f.version);
-    println!("endianness:          little");
+    println!(
+        "endianness:          {}",
+        if f.little_endian { "little" } else { "big" }
+    );
     println!("tensors:             {}", f.tensors.len());
     println!("metadata entries:    {}", f.metadata.len());
     println!("alignment:           {}", f.alignment);

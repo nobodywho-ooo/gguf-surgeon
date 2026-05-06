@@ -29,6 +29,23 @@ The editor exposes both interaction modes from the same binary: a **CLI** with s
 
 **Supported GGUF versions: 1, 2, and 3**, in both little- and big-endian. v1 used u32 length prefixes (deprecated in `llama.cpp`); v2 promoted them to u64; v3 added formal big-endian support. Endianness is detected automatically by trying the version field in both byte orders. Files round-trip in their original version and byte order on save. Unknown versions fail loudly at open time.
 
+## Install
+
+Requires a Rust toolchain (`rustup install stable` if you don't have one).
+
+```sh
+# Install the binary into ~/.cargo/bin/gguf
+cargo install --git https://github.com/nobodywho-ooo/gguf-surgeon
+
+# …or build locally
+git clone https://github.com/nobodywho-ooo/gguf-surgeon
+cd gguf-surgeon
+cargo build --release
+# Binary lands at target/release/gguf
+```
+
+The compiled binary is named `gguf` (the crate is `gguf-surgeon`).
+
 ## Usage
 
 ```sh
@@ -144,6 +161,10 @@ The result: a spec change at most requires updating an external schema file — 
 - **Provenance stamps** (opt-in `general.last_edited_by` / `general.last_edited_at`).
 - **Undo/redo within a session** — track the metadata state stack so the TUI can step back through edits.
 - **TOML patches** alongside JSON.
+
+## License
+
+GPL v3. See [LICENSE](LICENSE) for the full text.
 
 ## References
 

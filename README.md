@@ -164,7 +164,7 @@ The result: a spec change at most requires updating an external schema file — 
 
 ## License
 
-GPL v3. See [LICENSE](LICENSE) for the full text.
+EUPL-1.2. See [LICENSE](LICENSE) for the full text.
 
 ## References
 

@@ -20,12 +20,12 @@ Build an editor that can:
 The editor is implemented in **Rust**. The language fits the constraints directly:
 
 - **Memory safety on hostile binary input.** Parsing untrusted GGUF files is exactly the kind of work where C/C++ accumulate CVEs and where Rust's bounds checks and ownership model pay off — directly serving the *Robust against malformed input* principle below.
-- **Endian-explicit, low-level I/O.** Reading typed primitives in a chosen byte order is straightforward and zero-cost, which sets the stage for big-endian parsing as a future addition (today little-endian only).
+- **Endian-explicit, low-level I/O.** Reading typed primitives in either byte order is straightforward and zero-cost — both little- and big-endian GGUF files are handled. Endianness is auto-detected from the version field at parse time.
 - **Streaming and mmap without GC pauses.** `memmap2` for header-region reads, `std::io::BufReader`/`BufWriter` for streaming tensor copies — multi-gigabyte files never enter RAM.
 - **Type-tag dispatch with exhaustive matching.** GGUF's value-type enum maps to a Rust `enum`; `match` is checked at compile time, so a new primitive type added later is a hard compiler error rather than a silent fall-through.
 - **Cross-platform single binary.** Same codebase for Linux, macOS, and Windows; one static binary per platform makes distribution painless.
 
-The editor exposes both interaction modes from the same binary: a **CLI** with subcommands `list`, `get`, `set`, `add`, `rm`, `patch`, `info`, `check`, `array`, and `edit` for one-shot and scripted use, and a **TUI** built with `ratatui` (`gguf edit`) for interactive browsing and scalar editing. GGUF files almost always live on remote ML servers reachable only over SSH, so a terminal-native tool fits the audience; a graphical desktop UI is out of scope for the first release.
+The editor exposes both interaction modes from the same binary: a **CLI** with subcommands `list`, `get`, `set`, `add`, `rm`, `patch`, `info`, `check`, `array`, and `edit` for one-shot and scripted use, and a **TUI** built with `ratatui` (`gguf edit`) for interactive browsing and editing — both scalar values and array elements. GGUF files almost always live on remote ML servers reachable only over SSH, so a terminal-native tool fits the audience; a graphical desktop UI is out of scope for the first release.
 
 **Supported GGUF versions: 1, 2, and 3**, in both little- and big-endian. v1 used u32 length prefixes (deprecated in `llama.cpp`); v2 promoted them to u64; v3 added formal big-endian support. Endianness is detected automatically by trying the version field in both byte orders. Files round-trip in their original version and byte order on save. Unknown versions fail loudly at open time.
 
@@ -58,7 +58,7 @@ gguf check MODEL.gguf
 gguf --schema my-rules.json check MODEL.gguf
 gguf check MODEL.gguf --no-default-schema   # skip the built-in suggestions
 
-# Interactive TUI: j/k to move, / to search, e to edit, s to save, q to quit
+# Interactive TUI: j/k to move, / to search, e to edit (arrays open an element editor), s to save, q to quit
 gguf edit MODEL.gguf
 
 # Validate against a schema overlay; --force overrides schema errors
@@ -73,7 +73,7 @@ gguf --save-mode=in-place set MODEL.gguf general.author "me" -y   # refuse if it
 
 `gguf check FILE` is a read-only diagnostic that runs three layers of validation in order, merges the results, and prints them. It exits non-zero only if there are errors.
 
-1. **Format-level** — spec invariants from `validate_format` (currently: duplicate keys). Always on, can never be silenced.
+1. **Format-level** — spec invariants from `validate_format`: duplicate keys, and special-token-id values (BOS/EOS/EOT/EOM/UNK/PAD/CLS/MASK/SEP) that are negative or point past the end of `tokenizer.ggml.tokens`. Always on, can never be silenced.
 2. **Built-in suggestion schema** — embedded JSON with universal sanity checks (`general.architecture` required, `general.alignment` in 1..=4096, `general.quantization_version` in 1..=10, `general.file_type` is u32). All warnings; never blocks a save. Skip with `--no-default-schema`.
 3. **User-supplied `--schema PATH`** — your own JSON rules layered on top. Per-rule severity.
 
@@ -106,7 +106,7 @@ Output tags: `[format-err ]`, `[schema-err ]`, `[schema-warn]`. Same checks run 
 The editor must keep working when the GGUF spec changes — without a rewrite. That shapes the design:
 
 - **Generic, not key-aware.** The parser treats metadata as a flat list of `(key, type, value)` triples. It does not know that `general.architecture` or `tokenizer.ggml.tokens` exist or what they mean — and it does not need to. Well-known keys, vendor-specific keys, and arbitrary user-defined keys all flow through the same code path. New well-known keys appear automatically with no code changes.
-- **Self-describing input.** Every value carries its type tag in the file. Read the type from the file, never infer it from the key name. Read the format version, alignment, and tensor-data offset from the header rather than assuming them. (GGUF v3 also signals byte order via the magic; this editor currently parses little-endian files only — big-endian support is future work.)
+- **Self-describing input.** Every value carries its type tag in the file. Read the type from the file, never infer it from the key name. Read the format version, alignment, byte order, and tensor-data offset from the header rather than assuming them — endianness is auto-detected from the version field at parse time and preserved on save.
 - **Preserve the unknown.** If a future spec adds a new primitive type the editor does not understand, fields of that type are kept as opaque bytes — still listable and round-trip safe, just not editable until support is added.
 - **Schema overlay is optional and external.** Any "this key should be a non-empty string", "this key is an enum of these values", or "render this as a chat template" knowledge lives in a swappable JSON schema file, not in the code. Updating for a new spec version means dropping in a new schema file. Each overlay declares the GGUF version range it applies to. The overlay file format itself has a defined schema and is validated on load: a malformed overlay is rejected, never silently ignored.
 - **Always verify version compatibility on open.** Every time a file is opened, the version field is read from the header and checked against the set of versions this build supports (currently `1, 2, 3`). Known version → proceed. Unknown version → fail loudly with the version number; never silently assume a newer version behaves like an older one.
@@ -121,7 +121,7 @@ The editor must keep working when the GGUF spec changes — without a rewrite. T
   1. *Header overwrite* — the new metadata block fits within the existing header region (typical when the change is absorbed by the reserved padding budget). The temp is created via `std::fs::copy`, which uses `clonefile` on macOS APFS and `copy_file_range` with reflink on Linux Btrfs/XFS — on those filesystems tensor bytes are never physically read or written. On filesystems without copy-on-write (ext4, NTFS), `std::fs::copy` falls back to a regular byte copy. After the copy, only the header region is overwritten in place.
   2. *Full rewrite* — the size delta exceeds the padding budget. Tensor data must shift to a new offset. The whole file is streamed through `BufReader`/`BufWriter` chunks: header re-emitted, tensor-info offsets stay valid (they're relative to the tensor-data start), tensor data copied to the temp, then atomically renamed.
 
-  The editor reserves **64 KB of header padding** on every save (a `general.padding` sentinel key holding zeros, sized to round the header up to the next 64 KB boundary) so that most realistic edits — chat-template changes, vocab tweaks, key additions — stay in the header-overwrite path and never trigger a full tensor copy.
+  The editor reserves **64 KB of header padding** on every save (a vendor-namespaced `ggufsurgeon.padding` sentinel key holding zeros, sized to round the header up to the next 64 KB boundary) so that most realistic edits — chat-template changes, vocab tweaks, key additions — stay in the header-overwrite path and never trigger a full tensor copy. The sentinel key is filtered out of user-facing displays (`list`, `get`, TUI). Files written by older versions of this editor used `general.padding`; that is silently migrated on the next save when its content matches the editor's own zero-array shape.
 - **Streaming I/O.** Tensor bytes are never fully loaded into memory. Only the header and the tensor-descriptor table are parsed; tensor data flows through in fixed-size chunks during a rewrite. The editor must work on multi-gigabyte files on a machine with modest RAM.
 - **Robust against malformed input.** Treat every input file as untrusted. Cap declared array, string, and tensor sizes against the actual file length, bounds-check every offset, reject overflowing or circular values. The parser must fail cleanly — never crash, hang, or allocate unboundedly — on a corrupt or hostile file.
 

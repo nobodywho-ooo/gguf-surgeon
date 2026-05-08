@@ -1,8 +1,11 @@
 use std::io;
 use std::path::{Path, PathBuf};
+use std::process::Command;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
-use anyhow::{Result, anyhow};
+use anyhow::{Context, Result, anyhow};
 use crossterm::{
+    cursor::Show,
     event::{
         self, DisableBracketedPaste, EnableBracketedPaste, Event, KeyCode, KeyEventKind,
     },
@@ -67,6 +70,26 @@ pub fn run(
                 }
                 continue;
             }
+            if let Mode::ExternalEdit { idx } = app.mode {
+                // Suspend the TUI, hand control to $EDITOR on the temp file, and
+                // resume when it exits. The screen rendered above this branch is
+                // overwritten by the editor; it comes back on the next iteration.
+                match run_external_edit(&mut term, &mut app, idx) {
+                    Ok(true) => {
+                        app.mode = Mode::List;
+                        app.status = Some("value updated (unsaved)".into());
+                    }
+                    Ok(false) => {
+                        app.mode = Mode::List;
+                        app.status = Some("unchanged".into());
+                    }
+                    Err(e) => {
+                        app.mode = Mode::List;
+                        app.status = Some(format!("editor failed: {e}"));
+                    }
+                }
+                continue;
+            }
             match event::read()? {
                 Event::Key(k) if k.kind == KeyEventKind::Press => {
                     if app.handle_key(k.code)? {
@@ -123,6 +146,10 @@ enum Mode {
         buf: String,
         error: Option<String>,
     },
+    /// Suspended state: the main loop will hand control to `$EDITOR` on the
+    /// next iteration, then pick the parsed result back up. Used for editing
+    /// long string values (chat templates) that don't fit a single-line input.
+    ExternalEdit { idx: usize },
     SaveConfirm,
     Saving,
     QuitConfirm,
@@ -202,8 +229,10 @@ impl App {
             Mode::ArrayInput { .. } => Ok(self.handle_array_input(code)),
             Mode::SaveConfirm => self.handle_save_confirm(code),
             Mode::QuitConfirm => Ok(self.handle_quit_confirm(code)),
-            // Mode::Saving runs synchronously in the main loop and never reads keys.
-            Mode::Saving => Ok(false),
+            // Mode::Saving and Mode::ExternalEdit are handled synchronously by
+            // the main loop in `run`, which suspends event reading; control
+            // never reaches here in those modes.
+            Mode::Saving | Mode::ExternalEdit { .. } => Ok(false),
         }
     }
 
@@ -246,6 +275,23 @@ impl App {
                             buf: render_for_edit(v),
                             error: None,
                         };
+                    }
+                }
+            }
+            KeyCode::Char('E') => {
+                // Open the value in $EDITOR. Useful for multi-KB strings (chat
+                // templates) that don't fit a single-line input. Arrays are still
+                // routed to the array browser; the external editor edits one
+                // scalar at a time.
+                if let Some(&idx) = self.visible.get(self.cursor) {
+                    let (_, v) = &self.file.metadata[idx];
+                    if matches!(v, GgufValue::Array(_)) {
+                        self.status = Some(
+                            "external editor not supported for arrays — use `e` to browse elements"
+                                .into(),
+                        );
+                    } else {
+                        self.mode = Mode::ExternalEdit { idx };
                     }
                 }
             }
@@ -570,6 +616,105 @@ impl App {
     }
 }
 
+/// Suspend the TUI, write the current value of `metadata[idx]` to a temp file,
+/// hand the file to `$EDITOR` (falling back to `$VISUAL`, then `nano`), then
+/// read the result back when the editor exits and resume the TUI. Returns
+/// `Ok(true)` if the value actually changed, `Ok(false)` if the editor exited
+/// without modifying it. Errors leave the value untouched but always restore
+/// the terminal state — the user lands back on the list, not in a broken shell.
+fn run_external_edit(
+    term: &mut Terminal<CrosstermBackend<io::Stdout>>,
+    app: &mut App,
+    idx: usize,
+) -> Result<bool> {
+    // Suspend the TUI so the editor sees a clean terminal. `Show` is necessary
+    // because ratatui's draw cycle hides the cursor every frame; without it,
+    // editors that don't issue their own `Show` (nano, some `vi` builds) open
+    // with an invisible cursor.
+    disable_raw_mode()?;
+    execute!(
+        term.backend_mut(),
+        DisableBracketedPaste,
+        LeaveAlternateScreen,
+        Show,
+    )?;
+
+    // Run everything inside an inner closure so we always restore the terminal,
+    // even if the editor errored or the file disappeared.
+    let outcome = (|| -> Result<bool> {
+        let key = app.file.metadata[idx].0.clone();
+        let value = &app.file.metadata[idx].1;
+        let ty = value.ty();
+        if matches!(ty, GgufValueType::Array) {
+            return Err(anyhow!("external editor not supported for arrays"));
+        }
+
+        // Pick a file extension hint so editors with syntax-by-extension light up.
+        let ext = if key.ends_with("chat_template") {
+            "j2"
+        } else if key.contains("json") {
+            "json"
+        } else {
+            "txt"
+        };
+
+        // Pid + atomic counter is enough uniqueness for an interactive single-user TUI.
+        static COUNTER: AtomicUsize = AtomicUsize::new(0);
+        let n = COUNTER.fetch_add(1, Ordering::SeqCst);
+        let pid = std::process::id();
+        let temp_path = std::env::temp_dir().join(format!("ggufsurgeon-edit-{pid}-{n}.{ext}"));
+
+        let original = render_for_edit(value);
+        let original_ends_with_newline = original.ends_with('\n');
+        std::fs::write(&temp_path, &original)
+            .with_context(|| format!("could not write temp file at {}", temp_path.display()))?;
+
+        let editor = std::env::var("EDITOR")
+            .or_else(|_| std::env::var("VISUAL"))
+            .unwrap_or_else(|_| "nano".into());
+
+        let status = Command::new(&editor)
+            .arg(&temp_path)
+            .status()
+            .with_context(|| format!("could not spawn `{editor}` (set $EDITOR if not on PATH)"))?;
+
+        if !status.success() {
+            let _ = std::fs::remove_file(&temp_path);
+            return Err(anyhow!("`{editor}` exited with {status}"));
+        }
+
+        let mut new_text = std::fs::read_to_string(&temp_path)
+            .with_context(|| format!("could not read temp file at {}", temp_path.display()))?;
+        let _ = std::fs::remove_file(&temp_path);
+
+        // Strip exactly one auto-added trailing newline if the original had none.
+        // Most editors `fixeol` on save; preserving that round-trips cleanly for
+        // values that don't end with a newline, while leaving deliberate trailing
+        // newlines intact.
+        if !original_ends_with_newline && new_text.ends_with('\n') {
+            new_text.truncate(new_text.len() - 1);
+            if new_text.ends_with('\r') {
+                new_text.truncate(new_text.len() - 1);
+            }
+        }
+
+        if new_text == original {
+            return Ok(false);
+        }
+
+        let new_value = parse_value_for_type(&new_text, ty)?;
+        app.file.metadata[idx].1 = new_value;
+        Ok(true)
+    })();
+
+    // Always restore the terminal state, regardless of how the editor flow ended.
+    enable_raw_mode()?;
+    execute!(term.backend_mut(), EnterAlternateScreen, EnableBracketedPaste)?;
+    term.clear()?;
+
+    outcome
+}
+
 fn parse_value_for_type(input: &str, ty: GgufValueType) -> Result<GgufValue> {
     Ok(match ty {
         GgufValueType::Uint8 => GgufValue::Uint8(input.parse()?),
@@ -719,7 +864,7 @@ fn draw_status(f: &mut ratatui::Frame, area: Rect, app: &App) {
                 format!("{} of {}", app.cursor + 1, app.visible.len())
             };
             let base = format!(
-                "[{counter}]  [/] search  [enter] details  [e] edit  [s] save  [q] quit  [j/k] move",
+                "[{counter}]  [/] search  [enter] details  [e] edit  [E] $EDITOR  [s] save  [q] quit  [j/k] move",
             );
             if let Some(s) = &app.status {
                 format!("{base}    {s}")
@@ -766,6 +911,7 @@ fn draw_status(f: &mut ratatui::Frame, area: Rect, app: &App) {
         }
         Mode::SaveConfirm => "save? [y] yes  [n/esc] cancel".to_string(),
         Mode::Saving => "saving... do not close the terminal".to_string(),
+        Mode::ExternalEdit { .. } => "opening $EDITOR...".to_string(),
         Mode::QuitConfirm => "discard unsaved changes? [y] yes  [n/esc] cancel".to_string(),
     };
     let p = Paragraph::new(text).block(Block::default().borders(Borders::ALL));

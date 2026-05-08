@@ -48,7 +48,9 @@ enum Cmd {
         limit: Option<usize>,
     },
     /// Set a scalar metadata value, parsing the input as the existing key's type.
-    /// In-place edit via temp + atomic rename. Array values are not supported here yet.
+    /// `value` may be a literal string, `@FILE` to read from a file (useful for
+    /// multi-KB chat templates), or `@-` to read from stdin. `@@` escapes a
+    /// literal leading `@`. Array values are not supported here yet.
     Set {
         file: PathBuf,
         key: String,
@@ -59,6 +61,7 @@ enum Cmd {
     },
     /// Add a new metadata entry. Fails if the key already exists.
     /// TYPE is one of: u8 i8 u16 i16 u32 i32 u64 i64 f32 f64 bool string.
+    /// `value` accepts the same forms as `set`: literal, `@FILE`, `@-`, `@@literal`.
     Add {
         file: PathBuf,
         key: String,
@@ -345,8 +348,10 @@ fn set(path: &Path, key: &str, raw_value: &str, yes: bool, env: &Env) -> Result<
         .position(|(k, _)| k == key)
         .with_context(|| format!("key not found: {key}"))?;
     let ty = f.metadata[pos].1.ty();
-    let new_value =
-        parse_value(raw_value, ty).with_context(|| format!("could not parse value for key {key}"))?;
+    let raw_value = resolve_value_arg(raw_value)
+        .with_context(|| format!("could not resolve value for key {key}"))?;
+    let new_value = parse_value(&raw_value, ty)
+        .with_context(|| format!("could not parse value for key {key}"))?;
 
     let before = f.metadata.clone();
     f.metadata[pos].1 = new_value;
@@ -366,7 +371,9 @@ fn add(path: &Path, key: &str, ty_name: &str, raw_value: &str, yes: bool, env: &
     if matches!(ty, GgufValueType::Array) {
         bail!("adding array values is not supported via the CLI yet");
     }
-    let value = parse_value(raw_value, ty)
+    let raw_value = resolve_value_arg(raw_value)
+        .with_context(|| format!("could not resolve value for key {key}"))?;
+    let value = parse_value(&raw_value, ty)
         .with_context(|| format!("could not parse value as {ty_name}"))?;
 
     let before = f.metadata.clone();
@@ -693,6 +700,30 @@ fn info(path: &Path) -> Result<()> {
     Ok(())
 }
 
+/// Resolve a CLI value argument: literal, `@FILE` (read file contents), `@-`
+/// (read stdin), or `@@literal` (escaped literal `@literal`). The file form is
+/// what makes pasting a multi-KB chat template ergonomic from the CLI; the
+/// stdin form lets generators pipe values straight in. File contents are used
+/// as-is — no trailing-newline stripping. If you need round-tripping with
+/// `gguf get` (which prints a trailing newline), preprocess the file accordingly.
+fn resolve_value_arg(raw: &str) -> Result<String> {
+    let Some(rest) = raw.strip_prefix('@') else {
+        return Ok(raw.to_string());
+    };
+    if let Some(literal) = rest.strip_prefix('@') {
+        // `@@x` is a literal `@x` (escape).
+        return Ok(format!("@{literal}"));
+    }
+    if rest == "-" {
+        let mut s = String::new();
+        io::stdin()
+            .read_to_string(&mut s)
+            .context("could not read value from stdin")?;
+        return Ok(s);
+    }
+    std::fs::read_to_string(rest).with_context(|| format!("could not read value from {rest}"))
+}
+
 fn parse_value(input: &str, ty: GgufValueType) -> Result<GgufValue> {
     Ok(match ty {
         GgufValueType::Uint8 => GgufValue::Uint8(input.parse()?),
@@ -709,4 +740,43 @@ fn parse_value(input: &str, ty: GgufValueType) -> Result<GgufValue> {
         GgufValueType::String => GgufValue::String(input.to_string()),
         GgufValueType::Array => bail!("setting array values is not supported via the CLI yet"),
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn resolve_value_arg_literal_passes_through() {
+        assert_eq!(resolve_value_arg("hello").unwrap(), "hello");
+        assert_eq!(resolve_value_arg("").unwrap(), "");
+        assert_eq!(resolve_value_arg("with spaces and {jinja}").unwrap(),
+                   "with spaces and {jinja}");
+    }
+
+    #[test]
+    fn resolve_value_arg_double_at_escapes_literal() {
+        assert_eq!(resolve_value_arg("@@hello").unwrap(), "@hello");
+        assert_eq!(resolve_value_arg("@@").unwrap(), "@");
+    }
+
+    #[test]
+    fn resolve_value_arg_at_file_reads_file() {
+        let pid = std::process::id();
+        let path = std::env::temp_dir().join(format!("ggufsurgeon-test-resolve-{pid}.txt"));
+        let contents = "{% if messages[0]['role'] == 'system' %}{{ messages[0]['content'] }}{% endif %}";
+        std::fs::write(&path, contents).unwrap();
+
+        let arg = format!("@{}", path.display());
+        let resolved = resolve_value_arg(&arg).unwrap();
+        assert_eq!(resolved, contents);
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn resolve_value_arg_missing_file_errors() {
+        let arg = "@/this/path/does/not/exist/ggufsurgeon-bogus";
+        assert!(resolve_value_arg(arg).is_err());
+    }
 }

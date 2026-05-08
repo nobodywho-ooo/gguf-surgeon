@@ -59,6 +59,12 @@ gguf set MODEL.gguf general.architecture mistral -y
 gguf add MODEL.gguf general.author string "vag.gergo" -y
 gguf rm  MODEL.gguf outdated.key -y
 
+# Read a long value from a file (chat templates, long Jinja blobs)
+gguf get MODEL.gguf tokenizer.chat_template > template.j2
+$EDITOR  template.j2
+gguf set MODEL.gguf tokenizer.chat_template @template.j2 -y
+generate-template.py | gguf set MODEL.gguf tokenizer.chat_template @- -y
+
 # Edit array values element by element
 gguf array len    MODEL.gguf tokenizer.ggml.tokens
 gguf array push   MODEL.gguf tokenizer.ggml.tokens "<|new_token|>" -y
@@ -75,7 +81,8 @@ gguf check MODEL.gguf
 gguf --schema my-rules.json check MODEL.gguf
 gguf check MODEL.gguf --no-default-schema   # skip the built-in suggestions
 
-# Interactive TUI: j/k to move, / to search, e to edit (arrays open an element editor), s to save, q to quit
+# Interactive TUI: j/k move, / search, e edit (arrays open an element editor),
+# E open value in $EDITOR (for multi-KB chat templates), s save, q quit
 gguf edit MODEL.gguf
 
 # Validate against a schema overlay; --force overrides schema errors
@@ -148,7 +155,7 @@ The result: a spec change at most requires updating an external schema file — 
 
 - Read and write GGUF v1, v2, and v3, in both little- and big-endian.
 - Preserve tensor data, alignment, and padding exactly.
-- Edit scalar values (integers, floats, bools, strings) via CLI (`set`, `add`) or TUI. Edit array values (tokenizer vocabulary, merges) element-by-element via `gguf array {set,push,pop,insert,remove,len}`, or as a whole via the `patch` JSON command.
+- Edit scalar values (integers, floats, bools, strings) via CLI (`set`, `add`) or TUI. CLI accepts `@FILE` (read value from file) and `@-` (read from stdin) for ergonomic chat-template editing; TUI binds `E` to open the current value in `$EDITOR` and read the result back. Edit array values (tokenizer vocabulary, merges) element-by-element via `gguf array {set,push,pop,insert,remove,len}`, or as a whole via the `patch` JSON command.
 - Treat custom and arbitrary keys as first-class. Any key name in any namespace can be listed, edited, added, or removed. Well-known keys get no special privileges; unknown keys get no special restrictions. The optional schema overlay only affects display and validation hints — its absence never blocks editing.
 - Round-trip safety: re-saving an unedited file produces a byte-identical output, even for files containing keys or types the editor has never seen before.
 - Preview before save: every save shows a diff (added, removed, and changed keys, with old → new values), names which save path will be taken (header overwrite or full rewrite), and waits for confirmation.

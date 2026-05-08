@@ -2,6 +2,8 @@
 
 Surgical metadata edits for GGUF model files: browse the key/value metadata stored in a `.gguf` file and modify fields in place without touching the tensor data.
 
+![The gguf-surgeon TUI browsing metadata in Qwen3.6-35B-A3B-UD-Q4_K_M.gguf.](docs/tui.png)
+
 ## Background
 
 GGUF (GGML Universal Format) is the binary container used by `llama.cpp` and related projects to ship LLM weights. Every file starts with a header that describes the model: architecture, name, quantization, context length, tokenizer vocabulary, chat template, and arbitrary user-defined keys. Tensor data follows after the header.

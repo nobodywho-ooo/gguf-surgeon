@@ -1,7 +1,9 @@
-//! Regression tests for two bugs surfaced in code review and now fixed.
-//! Each test was originally written to fail while the bug existed (and was
-//! marked `#[ignore]` to keep the default suite green). With the fixes in
-//! place these tests are now expected to pass on every run.
+//! Regression tests for bugs surfaced in code review and now fixed. Each test
+//! was originally written to fail while the bug existed; with the fixes in
+//! place these tests are now expected to pass on every run, guarding against
+//! the bug coming back. Currently covers Bug #1 (TUI signature pin), Bug #2
+//! (foreign-`general.padding` preservation), Bug #4 (schema length unit:
+//! bytes), and Bug #5 (schema numeric precision for `u64`/`i64`).
 
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicUsize, Ordering};

@@ -669,46 +669,52 @@ fn run_external_edit(
         std::fs::write(&temp_path, &original)
             .with_context(|| format!("could not write temp file at {}", temp_path.display()))?;
 
-        let editor = std::env::var("EDITOR")
-            .or_else(|_| std::env::var("VISUAL"))
-            .unwrap_or_else(|_| "nano".into());
+        // From here on the temp file exists; wrap the rest in an inner closure
+        // so the cleanup runs once, unconditionally, on every error path
+        // (editor spawn failure, non-zero exit, UTF-8 read failure, parse
+        // failure). The earlier per-site cleanups were easy to miss — see the
+        // pre-fix Bug #3 (read-then-remove order) and the spawn-failure leak.
+        let result = (|| -> Result<bool> {
+            let editor = std::env::var("EDITOR")
+                .or_else(|_| std::env::var("VISUAL"))
+                .unwrap_or_else(|_| "nano".into());
 
-        let status = Command::new(&editor)
-            .arg(&temp_path)
-            .status()
-            .with_context(|| format!("could not spawn `{editor}` (set $EDITOR if not on PATH)"))?;
+            let status = Command::new(&editor)
+                .arg(&temp_path)
+                .status()
+                .with_context(|| {
+                    format!("could not spawn `{editor}` (set $EDITOR if not on PATH)")
+                })?;
 
-        if !status.success() {
-            let _ = std::fs::remove_file(&temp_path);
-            return Err(anyhow!("`{editor}` exited with {status}"));
-        }
-
-        // Always remove the temp file before propagating a read error; the
-        // previous order (`?` on read followed by remove) leaked the file on
-        // UTF-8 errors, which a stray paste can trigger.
-        let read_result = std::fs::read_to_string(&temp_path);
-        let _ = std::fs::remove_file(&temp_path);
-        let mut new_text = read_result
-            .with_context(|| format!("could not read temp file at {}", temp_path.display()))?;
-
-        // Strip exactly one auto-added trailing newline if the original had none.
-        // Most editors `fixeol` on save; preserving that round-trips cleanly for
-        // values that don't end with a newline, while leaving deliberate trailing
-        // newlines intact.
-        if !original_ends_with_newline && new_text.ends_with('\n') {
-            new_text.truncate(new_text.len() - 1);
-            if new_text.ends_with('\r') {
-                new_text.truncate(new_text.len() - 1);
+            if !status.success() {
+                return Err(anyhow!("`{editor}` exited with {status}"));
             }
-        }
 
-        if new_text == original {
-            return Ok(false);
-        }
+            let mut new_text = std::fs::read_to_string(&temp_path).with_context(|| {
+                format!("could not read temp file at {}", temp_path.display())
+            })?;
 
-        let new_value = parse_value_for_type(&new_text, ty)?;
-        app.file.metadata[idx].1 = new_value;
-        Ok(true)
+            // Strip exactly one auto-added trailing newline if the original had
+            // none. Most editors `fixeol` on save; preserving that round-trips
+            // cleanly for values that don't end with a newline, while leaving
+            // deliberate trailing newlines intact.
+            if !original_ends_with_newline && new_text.ends_with('\n') {
+                new_text.truncate(new_text.len() - 1);
+                if new_text.ends_with('\r') {
+                    new_text.truncate(new_text.len() - 1);
+                }
+            }
+
+            if new_text == original {
+                return Ok(false);
+            }
+
+            let new_value = parse_value_for_type(&new_text, ty)?;
+            app.file.metadata[idx].1 = new_value;
+            Ok(true)
+        })();
+        let _ = std::fs::remove_file(&temp_path);
+        result
     })();
 
     // Always restore the terminal state, regardless of how the editor flow ended.

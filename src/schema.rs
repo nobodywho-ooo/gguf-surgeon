@@ -164,27 +164,25 @@ fn check_rule(key: &str, value: &GgufValue, rule: &Rule, sev: Severity, out: &mu
             message: format!("value not in allowed set [{listed}]"),
         });
     }
-    if let Some(n) = numeric_value(value) {
-        if let Some(min) = rule.min
-            && n < min
-        {
-            out.push(Violation {
-                origin: Origin::Schema,
-                key: key.to_string(),
-                severity: sev,
-                message: format!("value {n} below min {min}"),
-            });
-        }
-        if let Some(max) = rule.max
-            && n > max
-        {
-            out.push(Violation {
-                origin: Origin::Schema,
-                key: key.to_string(),
-                severity: sev,
-                message: format!("value {n} above max {max}"),
-            });
-        }
+    if let Some(min) = rule.min
+        && numeric_below(value, min)
+    {
+        out.push(Violation {
+            origin: Origin::Schema,
+            key: key.to_string(),
+            severity: sev,
+            message: format!("value {} below min {min}", display_numeric(value)),
+        });
+    }
+    if let Some(max) = rule.max
+        && numeric_above(value, max)
+    {
+        out.push(Violation {
+            origin: Origin::Schema,
+            key: key.to_string(),
+            severity: sev,
+            message: format!("value {} above max {max}", display_numeric(value)),
+        });
     }
     if let Some(len) = length_of(value) {
         if let Some(min) = rule.min_length
@@ -265,9 +263,59 @@ fn numeric_value(v: &GgufValue) -> Option<f64> {
     })
 }
 
+/// Compare a metadata value to a numeric bound. For Uint64/Int64 values we
+/// avoid going through f64 so integers above 2^53 compare exactly. The bound
+/// itself is stored as f64 in the schema (see `Rule::min`/`Rule::max`), so for
+/// bounds beyond f64's integer-exact range a comparison is still imprecise —
+/// but for the common case (integral bounds up to 2^53), this is correct.
+fn numeric_below(value: &GgufValue, bound: f64) -> bool {
+    match *value {
+        GgufValue::Uint64(n) if bound.is_finite() && bound >= 0.0 && bound <= u64::MAX as f64 => {
+            n < (bound as u64)
+        }
+        GgufValue::Int64(n)
+            if bound.is_finite() && bound >= i64::MIN as f64 && bound <= i64::MAX as f64 =>
+        {
+            n < (bound as i64)
+        }
+        _ => numeric_value(value).is_some_and(|n| n < bound),
+    }
+}
+
+fn numeric_above(value: &GgufValue, bound: f64) -> bool {
+    match *value {
+        GgufValue::Uint64(n) if bound.is_finite() && bound >= 0.0 && bound <= u64::MAX as f64 => {
+            n > (bound as u64)
+        }
+        GgufValue::Int64(n)
+            if bound.is_finite() && bound >= i64::MIN as f64 && bound <= i64::MAX as f64 =>
+        {
+            n > (bound as i64)
+        }
+        _ => numeric_value(value).is_some_and(|n| n > bound),
+    }
+}
+
+/// Stringify a numeric value for violation messages without going through f64,
+/// preserving full precision for u64/i64 above 2^53.
+fn display_numeric(v: &GgufValue) -> String {
+    match v {
+        GgufValue::Uint64(n) => n.to_string(),
+        GgufValue::Int64(n) => n.to_string(),
+        _ => numeric_value(v)
+            .map(|n| n.to_string())
+            .unwrap_or_default(),
+    }
+}
+
 fn length_of(v: &GgufValue) -> Option<usize> {
     Some(match v {
-        GgufValue::String(s) => s.chars().count(),
+        // For strings, count bytes (UTF-8 encoded length). This matches what
+        // gets serialized into the GGUF header and what most users expect when
+        // they write a `max_length` constraint against a binary-format spec.
+        // Earlier versions used `chars().count()` (Unicode code-point count);
+        // see README for the documented unit.
+        GgufValue::String(s) => s.len(),
         GgufValue::Array(a) => a.elements.len(),
         _ => return None,
     })

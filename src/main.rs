@@ -290,50 +290,78 @@ fn get(path: &Path, key: &str, limit: Option<usize>) -> Result<()> {
 }
 
 fn print_value(value: &GgufValue, limit: Option<usize>) {
+    use std::io::IsTerminal;
+    let trailing_newline_for_scalar = io::stdout().is_terminal();
+    let _ = write_value(
+        &mut io::stdout(),
+        value,
+        limit,
+        trailing_newline_for_scalar,
+    );
+}
+
+/// Render `value` to `out`. For scalar values (everything except arrays),
+/// `trailing_newline` controls whether a final `\n` is appended — set it to
+/// `false` when stdout is redirected so `gguf get FILE key > template.j2`
+/// round-trips cleanly through `gguf set FILE key @template.j2`. Array output
+/// is multi-line by definition and ignores the flag.
+fn write_value(
+    out: &mut impl Write,
+    value: &GgufValue,
+    limit: Option<usize>,
+    trailing_newline: bool,
+) -> io::Result<()> {
     match value {
-        GgufValue::Uint8(n) => println!("{n}"),
-        GgufValue::Int8(n) => println!("{n}"),
-        GgufValue::Uint16(n) => println!("{n}"),
-        GgufValue::Int16(n) => println!("{n}"),
-        GgufValue::Uint32(n) => println!("{n}"),
-        GgufValue::Int32(n) => println!("{n}"),
-        GgufValue::Uint64(n) => println!("{n}"),
-        GgufValue::Int64(n) => println!("{n}"),
-        GgufValue::Float32(x) => println!("{x}"),
-        GgufValue::Float64(x) => println!("{x}"),
-        GgufValue::Bool(b) => println!("{b}"),
-        GgufValue::String(s) => println!("{s}"),
+        GgufValue::Uint8(n) => write!(out, "{n}")?,
+        GgufValue::Int8(n) => write!(out, "{n}")?,
+        GgufValue::Uint16(n) => write!(out, "{n}")?,
+        GgufValue::Int16(n) => write!(out, "{n}")?,
+        GgufValue::Uint32(n) => write!(out, "{n}")?,
+        GgufValue::Int32(n) => write!(out, "{n}")?,
+        GgufValue::Uint64(n) => write!(out, "{n}")?,
+        GgufValue::Int64(n) => write!(out, "{n}")?,
+        GgufValue::Float32(x) => write!(out, "{x}")?,
+        GgufValue::Float64(x) => write!(out, "{x}")?,
+        GgufValue::Bool(b) => write!(out, "{b}")?,
+        GgufValue::String(s) => write!(out, "{s}")?,
         GgufValue::Array(arr) => {
             let total = arr.elements.len();
             let n = limit.map_or(total, |l| l.min(total));
-            println!("[{}; {}]", arr.element_type.as_str(), total);
+            writeln!(out, "[{}; {}]", arr.element_type.as_str(), total)?;
             for (i, e) in arr.elements.iter().take(n).enumerate() {
-                print!("  [{i:>5}] ");
-                print_inline(e);
-                println!();
+                write!(out, "  [{i:>5}] ")?;
+                write_inline(out, e)?;
+                writeln!(out)?;
             }
             if n < total {
-                println!("  ... ({} more)", total - n);
+                writeln!(out, "  ... ({} more)", total - n)?;
             }
+            // Array output is multi-line; the trailing-newline flag is for
+            // scalars only.
+            return Ok(());
         }
     }
+    if trailing_newline {
+        writeln!(out)?;
+    }
+    Ok(())
 }
 
-fn print_inline(value: &GgufValue) {
+fn write_inline(out: &mut impl Write, value: &GgufValue) -> io::Result<()> {
     match value {
-        GgufValue::Uint8(n) => print!("{n}"),
-        GgufValue::Int8(n) => print!("{n}"),
-        GgufValue::Uint16(n) => print!("{n}"),
-        GgufValue::Int16(n) => print!("{n}"),
-        GgufValue::Uint32(n) => print!("{n}"),
-        GgufValue::Int32(n) => print!("{n}"),
-        GgufValue::Uint64(n) => print!("{n}"),
-        GgufValue::Int64(n) => print!("{n}"),
-        GgufValue::Float32(x) => print!("{x}"),
-        GgufValue::Float64(x) => print!("{x}"),
-        GgufValue::Bool(b) => print!("{b}"),
-        GgufValue::String(s) => print!("{s:?}"),
-        GgufValue::Array(arr) => print!("[{}; {}]", arr.element_type.as_str(), arr.elements.len()),
+        GgufValue::Uint8(n) => write!(out, "{n}"),
+        GgufValue::Int8(n) => write!(out, "{n}"),
+        GgufValue::Uint16(n) => write!(out, "{n}"),
+        GgufValue::Int16(n) => write!(out, "{n}"),
+        GgufValue::Uint32(n) => write!(out, "{n}"),
+        GgufValue::Int32(n) => write!(out, "{n}"),
+        GgufValue::Uint64(n) => write!(out, "{n}"),
+        GgufValue::Int64(n) => write!(out, "{n}"),
+        GgufValue::Float32(x) => write!(out, "{x}"),
+        GgufValue::Float64(x) => write!(out, "{x}"),
+        GgufValue::Bool(b) => write!(out, "{b}"),
+        GgufValue::String(s) => write!(out, "{s:?}"),
+        GgufValue::Array(arr) => write!(out, "[{}; {}]", arr.element_type.as_str(), arr.elements.len()),
     }
 }
 
@@ -474,22 +502,24 @@ fn print_diff(diff: &Diff) {
         println!("(no changes)");
         return;
     }
+    let stdout = io::stdout();
+    let mut out = stdout.lock();
     for (k, v) in &diff.additions {
-        print!("+ {k}: ");
-        print_inline(v);
-        println!();
+        let _ = write!(out, "+ {k}: ");
+        let _ = write_inline(&mut out, v);
+        let _ = writeln!(out);
     }
     for (k, v) in &diff.removals {
-        print!("- {k}: ");
-        print_inline(v);
-        println!();
+        let _ = write!(out, "- {k}: ");
+        let _ = write_inline(&mut out, v);
+        let _ = writeln!(out);
     }
     for (k, old, new) in &diff.changes {
-        print!("~ {k}: ");
-        print_inline(old);
-        print!(" -> ");
-        print_inline(new);
-        println!();
+        let _ = write!(out, "~ {k}: ");
+        let _ = write_inline(&mut out, old);
+        let _ = write!(out, " -> ");
+        let _ = write_inline(&mut out, new);
+        let _ = writeln!(out);
     }
 }
 
@@ -778,5 +808,39 @@ mod tests {
     fn resolve_value_arg_missing_file_errors() {
         let arg = "@/this/path/does/not/exist/ggufsurgeon-bogus";
         assert!(resolve_value_arg(arg).is_err());
+    }
+
+    // Bug #1 regression test (round-trip newline drift). Exercises both halves
+    // of the round-trip through the real code: `write_value` with
+    // `trailing_newline = false` (the redirected-stdout mode) writes the bytes
+    // that `gguf get FILE key > template.j2` produces, and `resolve_value_arg`
+    // reads them back the way `gguf set FILE key @template.j2` does. The
+    // round-trip is clean only when `write_value` suppresses the trailing
+    // newline on non-TTY stdout — which is what the TTY-aware `print_value`
+    // wrapper now does.
+    #[test]
+    fn round_trip_via_get_redirect_and_at_file_is_clean() {
+        let pid = std::process::id();
+        let path = std::env::temp_dir().join(format!("ggufsurgeon-roundtrip-bug-{pid}.txt"));
+
+        let original = "the quick brown fox";
+        let value = GgufValue::String(original.to_string());
+
+        // Simulate `gguf get FILE key > path` (non-TTY): no trailing newline.
+        let mut buf: Vec<u8> = Vec::new();
+        write_value(&mut buf, &value, None, /*trailing_newline=*/ false).unwrap();
+        std::fs::write(&path, &buf).unwrap();
+
+        // Simulate `gguf set FILE key @path`.
+        let arg = format!("@{}", path.display());
+        let resolved = resolve_value_arg(&arg).unwrap();
+        let _ = std::fs::remove_file(&path);
+
+        assert_eq!(
+            resolved, original,
+            "round-trip via `gguf get > file` + `gguf set @file` is not clean: \
+             got {} bytes ({:?}), expected {} bytes ({:?})",
+            resolved.len(), resolved, original.len(), original,
+        );
     }
 }

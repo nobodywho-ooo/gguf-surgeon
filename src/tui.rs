@@ -683,9 +683,13 @@ fn run_external_edit(
             return Err(anyhow!("`{editor}` exited with {status}"));
         }
 
-        let mut new_text = std::fs::read_to_string(&temp_path)
-            .with_context(|| format!("could not read temp file at {}", temp_path.display()))?;
+        // Always remove the temp file before propagating a read error; the
+        // previous order (`?` on read followed by remove) leaked the file on
+        // UTF-8 errors, which a stray paste can trigger.
+        let read_result = std::fs::read_to_string(&temp_path);
         let _ = std::fs::remove_file(&temp_path);
+        let mut new_text = read_result
+            .with_context(|| format!("could not read temp file at {}", temp_path.display()))?;
 
         // Strip exactly one auto-added trailing newline if the original had none.
         // Most editors `fixeol` on save; preserving that round-trips cleanly for
@@ -708,9 +712,15 @@ fn run_external_edit(
     })();
 
     // Always restore the terminal state, regardless of how the editor flow ended.
-    enable_raw_mode()?;
-    execute!(term.backend_mut(), EnterAlternateScreen, EnableBracketedPaste)?;
-    term.clear()?;
+    // Attempt all three operations unconditionally so a failure in one doesn't
+    // strand the terminal in an unrecoverable in-between state; only after all
+    // three have been attempted do we propagate the first error.
+    let r1 = enable_raw_mode();
+    let r2 = execute!(term.backend_mut(), EnterAlternateScreen, EnableBracketedPaste);
+    let r3 = term.clear();
+    r1?;
+    r2?;
+    r3?;
 
     outcome
 }

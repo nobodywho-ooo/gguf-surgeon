@@ -1,9 +1,13 @@
 //! Regression tests for bugs surfaced in code review and now fixed. Each test
 //! was originally written to fail while the bug existed; with the fixes in
 //! place these tests are now expected to pass on every run, guarding against
-//! the bug coming back. Currently covers Bug #1 (TUI signature pin), Bug #2
-//! (foreign-`general.padding` preservation), Bug #4 (schema length unit:
-//! bytes), and Bug #5 (schema numeric precision for `u64`/`i64`).
+//! the bug coming back. Currently covers: the TUI signature pin, preservation
+//! of foreign data under `general.padding`, the schema string length unit
+//! (UTF-8 bytes), and schema numeric precision for `u64`/`i64` bounds.
+//!
+//! Numbers in the section comments below are historical labels from the code
+//! review that produced each test; they are not consistent across review
+//! rounds and shouldn't be relied on outside this file.
 
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicUsize, Ordering};
